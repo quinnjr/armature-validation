@@ -9,6 +9,18 @@ Earlier changes are recorded in the workspace [`CHANGELOG.md`](../CHANGELOG.md).
 
 ## [Unreleased]
 
+### Fixed
+
+- **Security — `IsUrl` rejects embedded control characters and spaces.** The
+  WHATWG URL parser trims `c0_control_or_space` — every code point at or below
+  `U+0020`, tab, CR and LF among them — *before* parsing, so
+  `https://a.example/\r\nX-Injected: 1` parsed cleanly and was accepted. The
+  caller keeps the original string, so the validator was approving text it had
+  never actually examined, and that text still carried a CRLF into wherever it
+  was used next — a `Location` header being the obvious route to response
+  splitting. The check now uses the parser's own predicate rather than
+  `char::is_control()`, which misses `U+0020`.
+
 ### Added
 
 - Adopted the `validation` criterion benchmark from the root package's `benches/`. Run it with `cargo bench -p armature-validation --bench validation`. The crate now sets `autobenches = false`, so a new file under `benches/` needs an explicit `[[bench]]` entry.
