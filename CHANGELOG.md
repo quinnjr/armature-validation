@@ -9,6 +9,10 @@ Earlier changes are recorded in the workspace [`CHANGELOG.md`](../CHANGELOG.md).
 
 ## [Unreleased]
 
+### Added
+
+- Adopted the `validation` criterion benchmark from the root package's `benches/`. Run it with `cargo bench -p armature-validation --bench validation`. The crate now sets `autobenches = false`, so a new file under `benches/` needs an explicit `[[bench]]` entry.
+
 ### Fixed
 
 - **Breaking:** a field with rules that is absent from the input now fails validation. It was silently skipped, so a form missing `email` entirely passed `NotEmpty` and `IsEmail`; `ValidationRules::optional()` opts out.
