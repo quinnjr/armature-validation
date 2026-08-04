@@ -7,7 +7,7 @@ and this crate adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.h
 
 Earlier changes are recorded in the workspace [`CHANGELOG.md`](../CHANGELOG.md).
 
-## [Unreleased]
+## [0.3.0] - 2026-08-04
 
 ### Fixed
 
