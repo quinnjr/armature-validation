@@ -7,6 +7,20 @@ and this crate adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.h
 
 Earlier changes are recorded in the workspace [`CHANGELOG.md`](../CHANGELOG.md).
 
+## [0.4.0] - 2026-08-05
+
+### Changed
+
+- **Requires `armature-core` 0.9 (breaking).** The requirement moved `0.8` →
+  `0.9`. `armature-core 0.9.0` itself moves `armature-h1` across a breaking
+  0.x boundary; because `armature-core` types appear in this crate's own
+  public API, the requirement change is breaking here too and the minor moves
+  with it. Under Cargo's 0.x caret rules the 0.8 and 0.9 types are distinct
+  and do not unify, so a consumer holding an `armature-core 0.8` type cannot
+  pass it to this crate. Part of the `armature-core 0.9.0` release train; see
+  `armature-core`'s CHANGELOG for the publish order.
+- Requires `armature-proc-macro` 0.4 (was `0.3`); it moved its minor in the same train for the same reason.
+
 ## [0.3.1] - 2026-08-04
 
 ### Fixed
