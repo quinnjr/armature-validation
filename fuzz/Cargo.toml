@@ -1,0 +1,32 @@
+[package]
+name = "armature-validation-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+# Its own workspace root: `libfuzzer-sys` links a sanitizer runtime and builds
+# only on nightly, so a plain `cargo build` at the repo root must not reach it.
+[workspace]
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1", features = ["derive"] }
+armature-validation = { path = ".." }
+# Both are oracles, so their versions have to be the ones under test. `url`
+# mirrors `armature-validation`'s requirement exactly: `IsUrl` parses with this
+# crate, so comparing against a differently resolved copy would compare two
+# parsers rather than validate one. `uuid` has no counterpart in the parent —
+# `IsUuid` is hand-rolled — so it tracks the requirement the workspace uses
+# elsewhere instead of floating on `1`.
+uuid = "1.23"
+url = "2.5"
+
+[[bin]]
+name = "validators"
+path = "fuzz_targets/validators.rs"
+test = false
+doc = false
+bench = false
