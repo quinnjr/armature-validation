@@ -645,16 +645,16 @@ impl<T: Numeric> InRange<T> {
 ///
 /// Bounded by a byte budget, [`CACHE_BUDGET`], and an entry count,
 /// [`CACHE_ENTRIES`]. Each compiled entry is weighed at the smallest of
-/// [`SIZE_CLASSES`] its program compiles within (heap use measures at or
-/// below the class), or at the `regex` crate's default limit if it needs
-/// more; an error is weighed at [`ERROR_WEIGHT`]. Unicode classes make large
+/// [`SIZE_CLASSES`] its program compiles within, or at the `regex` crate's
+/// default limit if it needs more. The class limits each NFA separately, so
+/// the weight is approximate: anchored patterns measure below it, unanchored
+/// ones up to about 1.25 × it; an error is weighed at [`ERROR_WEIGHT`]. Unicode classes make large
 /// programs common: `^[\w.-]{3,32}$` is in the 2 MiB class and
 /// `^\w{1,64}$` in the 4 MiB one, so the budget holds 64–128 such patterns;
-/// `^[\w ]{1,100}$` needs more than 4 MiB and is weighed at 10 MiB. Each
-/// entry's lazy-DFA search cache (one per thread that uses it, up to the
-/// `regex` default of about 2 MiB) is not counted: capping it would make
-/// unanchored Unicode searches tens of times slower.
-///
+/// `^[\w ]{1,100}$` needs more than 4 MiB and is weighed at 10 MiB. Search
+/// caches are not retained: a cached `Regex` is cloned out per call, and a
+/// clone starts with an empty search-cache pool (tens of microseconds to
+/// warm, against milliseconds to compile), which is dropped with it.///
 /// Eviction is CLOCK (second chance): a lookup marks its entry referenced,
 /// the eviction hand skips and clears referenced entries, and a new entry is
 /// placed behind the hand. A working set that fits stays cached while a
@@ -690,13 +690,19 @@ struct Leader {
 
 impl Drop for Leader {
     fn drop(&mut self) {
+        // Reached unset only if the compile panicked. Waiters fail closed,
+        // with an error that says so rather than blaming the pattern; it is
+        // not cached, so the next call compiles afresh.
         let _ = self.slot.set(Err(regex::Error::Syntax(
-            "pattern compilation did not complete".to_string(),
+            "internal error: compiling this pattern panicked".to_string(),
         )));
-        MATCHES_INFLIGHT
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(&self.key);
+        let mut inflight = MATCHES_INFLIGHT.lock().unwrap_or_else(|e| e.into_inner());
+        if inflight
+            .get(&self.key)
+            .is_some_and(|slot| Arc::ptr_eq(slot, &self.slot))
+        {
+            inflight.remove(&self.key);
+        }
     }
 }
 
@@ -777,7 +783,10 @@ impl PatternCache {
 /// an allowlist, anchor the pattern (`^…$`) or use [`Matches::full`].
 ///
 /// Patterns should come from the application, not from requests: the `regex`
-/// engine matches in linear time, but compiling a pattern can be expensive.
+/// engine matches in linear time, but compiling a pattern can be expensive,
+/// and a stream of distinct request-built patterns would keep the compiled
+/// pattern cache full, holding up to its ~256 MiB budget for the life of the
+/// process.
 ///
 /// With the `(?m)` flag, `^` and `$` match at line boundaries, so
 /// `Matches::new("(?m)^[a-z]+$")` accepts `"abc\n<x>"`; [`Matches::full`]
@@ -821,25 +830,26 @@ impl Matches {
         if pattern.len() > MAX_PATTERN {
             return Self::compile(full, pattern).0.map(Self);
         }
-        let slot = {
+        // The `Leader` is built while the map is locked, so no code runs
+        // between registering the slot and owning its cleanup.
+        let leader = {
             let mut inflight = MATCHES_INFLIGHT.lock().unwrap_or_else(|e| e.into_inner());
             match inflight.get(&key) {
                 Some(slot) => Err(Arc::clone(slot)),
                 None => {
-                    let slot = Arc::new(OnceLock::new());
-                    inflight.insert(key.clone(), Arc::clone(&slot));
-                    Ok(slot)
+                    let leader = Leader {
+                        key: key.clone(),
+                        slot: Arc::new(OnceLock::new()),
+                    };
+                    inflight.insert(key.clone(), Arc::clone(&leader.slot));
+                    Ok(leader)
                 }
             }
         };
-        let slot = match slot {
-            Ok(slot) => slot,
+        let leader = match leader {
+            Ok(leader) => leader,
             // Another caller is compiling it: share its result.
             Err(slot) => return slot.wait().clone().map(Self),
-        };
-        let leader = Leader {
-            key: key.clone(),
-            slot,
         };
         // A leader that finished between the first lookup and taking the
         // slot has already cached the result.
@@ -862,8 +872,9 @@ impl Matches {
     /// Compile without the cache, returning the result and its cache weight.
     ///
     /// The smallest size class the program fits sets its weight. A failed
-    /// attempt stops once it exceeds its limit, and the limits roughly double,
-    /// so a miss on a large pattern costs under twice a plain compile.
+    /// attempt stops once it exceeds its limit, so a miss on a large pattern
+    /// costs about two to two and a half times a plain compile; only a cold
+    /// miss pays it, since results (errors included) are cached.
     fn compile(full: bool, pattern: &str) -> (Compiled, usize) {
         #[cfg(test)]
         {

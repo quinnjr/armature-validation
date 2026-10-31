@@ -106,12 +106,14 @@ Earlier changes are recorded in the workspace [`CHANGELOG.md`](https://github.co
 - `Matches::new` and `Matches::full` cache compiled patterns, and compile
   errors, so the derive's `regex` rule, which builds a `Matches` on every
   `validate()` call, no longer recompiles per request. The cache is bounded at
-  512 entries and about 256 MiB of compiled program (each entry weighed by
+  512 entries and about 256 MiB (up to ~1.25× for unanchored patterns) of compiled program (each entry weighed by
   the 256 KiB / 1 / 2 / 4 MiB class it fits, or 10 MiB beyond that; 64–128
   typical Unicode rules such as `[\w.-]{3,32}` fit), uses CLOCK eviction, and
   never caches sources over 1 KiB. Concurrent misses on one pattern compile
   it once and share the result. An application cycling through more large
-  patterns than fit recompiles on each call, as without a cache.
+  patterns than fit recompiles on each call, as without a cache. Each use
+  clones the cached `Regex`, which starts an empty search cache (microseconds
+  to warm) rather than retaining one per pattern.
 - `ValidationErrors::client_message` does not repeat the field name when the
   message already names it, lists at most 20 errors of at most 200 characters
   each, and replaces control, line/paragraph-separator and bidi formatting
