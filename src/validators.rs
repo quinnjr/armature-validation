@@ -11,6 +11,7 @@ use regex::Regex;
 use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::fmt;
+use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::{LazyLock, RwLock};
 
 /// RFC 5322 `dot-atom` local part, `@`, then a hostname.
@@ -314,7 +315,10 @@ impl IsUrl {
     }
 
     fn is_valid(value: &str) -> bool {
-        if !value.chars().all(Self::is_uri_char) || !Self::has_well_formed_escapes(value) {
+        if !value.chars().all(Self::is_uri_char)
+            || !Self::has_well_formed_escapes(value)
+            || value.matches('#').count() > 1
+        {
             return false;
         }
         let Some(rest) = Self::strip_scheme(value) else {
@@ -619,13 +623,19 @@ impl<T: Numeric> InRange<T> {
 ///
 /// Entries are also bounded in *compiled* size: a short pattern such as
 /// `\w{90}` compiles to megabytes, so only patterns that compile within
-/// [`MATCHES_CACHE_MAX_COMPILED`] are retained, keeping the cache to roughly
-/// 256 × 256 KiB at worst.
-static MATCHES_CACHE: LazyLock<RwLock<HashMap<String, Regex>>> =
+/// [`MATCHES_CACHE_MAX_COMPILED`] are retained, and their lazy-DFA caches
+/// (one per thread using the regex) are capped at
+/// [`MATCHES_CACHE_MAX_DFA`]. That bounds the cache at roughly
+/// 256 × (256 KiB + threads × 256 KiB).
+///
+/// Keyed by `(anchored, pattern)`: see [`Matches::full`].
+static MATCHES_CACHE: LazyLock<RwLock<HashMap<(bool, String), Regex>>> =
     LazyLock::new(|| RwLock::new(HashMap::new()));
+static MATCHES_CACHE_EVICTIONS: AtomicUsize = AtomicUsize::new(0);
 const MATCHES_CACHE_CAPACITY: usize = 256;
 const MATCHES_CACHE_MAX_PATTERN: usize = 1024;
 const MATCHES_CACHE_MAX_COMPILED: usize = 256 * 1024;
+const MATCHES_CACHE_MAX_DFA: usize = 256 * 1024;
 
 /// Custom regex validator.
 ///
@@ -644,39 +654,7 @@ pub struct Matches(pub Regex);
 impl Matches {
     /// Compile `pattern`, reusing an earlier compilation of the same pattern.
     pub fn new(pattern: &str) -> Result<Self, regex::Error> {
-        if let Some(regex) = MATCHES_CACHE
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(pattern)
-        {
-            return Ok(Self(regex.clone()));
-        }
-        // Try a compile small enough to cache; a pattern that does not fit is
-        // compiled again under the default limit and returned uncached.
-        let small = (pattern.len() <= MATCHES_CACHE_MAX_PATTERN)
-            .then(|| {
-                regex::RegexBuilder::new(pattern)
-                    .size_limit(MATCHES_CACHE_MAX_COMPILED)
-                    .build()
-            })
-            .and_then(|r| match r {
-                Err(regex::Error::CompiledTooBig(_)) => None,
-                other => Some(other),
-            })
-            .transpose()?;
-        let Some(regex) = small else {
-            return Ok(Self(Regex::new(pattern)?));
-        };
-        {
-            let mut cache = MATCHES_CACHE.write().unwrap_or_else(|e| e.into_inner());
-            if cache.len() >= MATCHES_CACHE_CAPACITY
-                && let Some(victim) = cache.keys().next().cloned()
-            {
-                cache.remove(&victim);
-            }
-            cache.insert(pattern.to_owned(), regex.clone());
-        }
-        Ok(Self(regex))
+        Self::cached_compile(false, pattern)
     }
 
     /// Like [`Matches::new`], but the pattern must match the whole value.
@@ -685,20 +663,64 @@ impl Matches {
     /// `)` is an error rather than a way to close the anchoring group early
     /// (`a)|(?:b` would otherwise become `^(?:a)|(?:b)$`).
     pub fn full(pattern: &str) -> Result<Self, regex::Error> {
-        let anchored = format!(r"\A(?:{pattern})\z");
-        // Only a pattern not seen before needs the stand-alone check; a cached
-        // anchored form was checked when it was inserted.
-        if !Self::cached(&anchored) {
-            Regex::new(pattern)?;
-        }
-        Self::new(&anchored)
+        Self::cached_compile(true, pattern)
     }
 
-    fn cached(pattern: &str) -> bool {
+    /// Compile `pattern` (anchored to the whole value if `full`), through the
+    /// cache. Anchored entries are keyed separately from plain ones, so an
+    /// anchored form only ever comes out of the cache via [`Matches::full`],
+    /// which checked the bare pattern before inserting it.
+    fn cached_compile(full: bool, pattern: &str) -> Result<Self, regex::Error> {
+        let key = (full, pattern.to_owned());
+        if let Some(regex) = MATCHES_CACHE
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&key)
+        {
+            return Ok(Self(regex.clone()));
+        }
+        let source = if full {
+            Regex::new(pattern)?;
+            format!(r"\A(?:{pattern})\z")
+        } else {
+            pattern.to_owned()
+        };
+        // Try a compile small enough to cache; a pattern that does not fit is
+        // compiled again under the default limits and returned uncached.
+        let small = (pattern.len() <= MATCHES_CACHE_MAX_PATTERN)
+            .then(|| {
+                regex::RegexBuilder::new(&source)
+                    .size_limit(MATCHES_CACHE_MAX_COMPILED)
+                    .dfa_size_limit(MATCHES_CACHE_MAX_DFA)
+                    .build()
+            })
+            .and_then(|r| match r {
+                Err(regex::Error::CompiledTooBig(_)) => None,
+                other => Some(other),
+            })
+            .transpose()?;
+        let Some(regex) = small else {
+            return Ok(Self(Regex::new(&source)?));
+        };
+        let mut cache = MATCHES_CACHE.write().unwrap_or_else(|e| e.into_inner());
+        if !cache.contains_key(&key) && cache.len() >= MATCHES_CACHE_CAPACITY {
+            // Rotate through positions rather than always taking the first
+            // key, which would evict the same hot entry on every insert.
+            let n = MATCHES_CACHE_EVICTIONS.fetch_add(1, AtomicOrdering::Relaxed) % cache.len();
+            if let Some(victim) = cache.keys().nth(n).cloned() {
+                cache.remove(&victim);
+            }
+        }
+        cache.insert(key, regex.clone());
+        Ok(Self(regex))
+    }
+
+    #[cfg(test)]
+    fn cached(full: bool, pattern: &str) -> bool {
         MATCHES_CACHE
             .read()
             .unwrap_or_else(|e| e.into_inner())
-            .contains_key(pattern)
+            .contains_key(&(full, pattern.to_owned()))
     }
 
     pub fn validate(&self, value: &str, field: &str) -> Result<(), ValidationError> {
@@ -1136,6 +1158,7 @@ mod tests {
             "http://example.com:080/",
             "http://example.com:0/",
             "https://example.com//evil.example/x",
+            "https://example.com/#a#b",
             // Malformed percent-escapes.
             "https://example.com/%zz",
             "https://example.com/%",
@@ -1208,6 +1231,9 @@ mod tests {
         // An unbalanced pattern must not escape the anchors.
         assert!(Matches::full("a)|(?:b").is_err());
         assert!(Matches::full("[a-z]+)|(?:x").is_err());
+        // Nor when its anchored form was cached through `new`.
+        Matches::new(r"\A(?:a)|(?:b)\z").unwrap();
+        assert!(Matches::full("a)|(?:b").is_err());
         let alt = Matches::full("a|b").unwrap();
         assert!(alt.validate("ab", "f").is_err());
         assert!(alt.validate("b", "f").is_ok());
@@ -1228,18 +1254,24 @@ mod tests {
                 .validate(&"a".repeat(200), "f")
                 .is_ok()
         );
-        assert!(!Matches::cached(big), "large compiled pattern was cached");
+        assert!(
+            !Matches::cached(false, big),
+            "large compiled pattern was cached"
+        );
     }
 
     #[test]
     fn matches_new_reuses_compiled_patterns_and_reports_bad_ones() {
         let pattern = "^cache-me-[0-9]+$";
         let a = Matches::new(pattern).unwrap();
-        assert!(Matches::cached(pattern));
+        assert!(Matches::cached(false, pattern));
         assert!(a.validate("cache-me-42", "f").is_ok());
         let long = format!("^{}$", "x".repeat(MATCHES_CACHE_MAX_PATTERN));
         assert!(Matches::new(&long).is_ok());
-        assert!(!Matches::cached(&long), "oversized pattern was cached");
+        assert!(
+            !Matches::cached(false, &long),
+            "oversized pattern was cached"
+        );
         assert!(Matches::new("(unclosed").is_err());
         // A failed compile is not cached as a success.
         assert!(Matches::new("(unclosed").is_err());

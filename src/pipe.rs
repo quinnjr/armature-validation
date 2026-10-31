@@ -53,14 +53,14 @@ impl ValidationPipe {
     where
         T: DeserializeOwned + Validate,
     {
+        // Compared as bytes: the header is client input and need not be
+        // ASCII, so slicing it as a `str` at a byte offset could panic.
         let is_json = req.headers.get("content-type").is_some_and(|ct| {
-            let media = ct.split(';').next().unwrap_or("").trim();
-            media.eq_ignore_ascii_case("application/json")
-                || media
-                    .get(..12)
-                    .is_some_and(|p| p.eq_ignore_ascii_case("application/"))
-                    && media.len() > 17
-                    && media[media.len() - 5..].eq_ignore_ascii_case("+json")
+            let media = ct.split(';').next().unwrap_or("").trim().as_bytes();
+            media.eq_ignore_ascii_case(b"application/json")
+                || (media.len() > b"application/+json".len()
+                    && media[..12].eq_ignore_ascii_case(b"application/")
+                    && media[media.len() - 5..].eq_ignore_ascii_case(b"+json"))
         });
         if !is_json {
             return Err(Error::UnsupportedMediaType(
@@ -232,6 +232,8 @@ mod tests {
             (Some("application/problem+json"), true),
             (Some("application/+json"), false),
             (Some("text/+json"), false),
+            (Some("application/aaaa\u{20AC}\u{20AC}"), false),
+            (Some("\u{20AC}\u{20AC}\u{20AC}\u{20AC}\u{20AC}+json"), false),
         ] {
             let mut req = request(body);
             if let Some(ct) = ct {

@@ -159,7 +159,13 @@ impl ValidationErrors {
         let mut message = self.errors[..shown]
             .iter()
             .map(|e| {
-                if e.message.starts_with(&e.field) {
+                // "email must be…" already names the field; "emails…" or an
+                // empty field name does not.
+                let names_field = !e.field.is_empty()
+                    && e.message.strip_prefix(&e.field).is_some_and(|rest| {
+                        rest.chars().next().is_none_or(|c| !c.is_alphanumeric() && c != '_')
+                    });
+                if names_field {
                     e.message.clone()
                 } else {
                     e.to_string()
@@ -169,7 +175,10 @@ impl ValidationErrors {
             .join("; ")
             // One line: a control character in a caller-written field or
             // message must not start a new log line or header.
-            .replace(char::is_control, " ");
+            .replace(
+                |c: char| c.is_control() || matches!(c, '\u{2028}' | '\u{2029}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}'),
+                " ",
+            );
         if self.errors.len() > shown {
             message.push_str(&format!(" (and {} more)", self.errors.len() - shown));
         }
@@ -229,8 +238,24 @@ mod tests {
 
     #[test]
     fn client_message_is_one_line() {
-        let errors = ValidationErrors::new(vec![ValidationError::new("a\r\nb", "x\ny")]);
-        assert_eq!(errors.client_message(), "a  b: x y");
+        let errors = ValidationErrors::new(vec![ValidationError::new(
+            "a\r\nb",
+            "x\ny\u{2028}z\u{202E}",
+        )]);
+        assert_eq!(errors.client_message(), "a  b: x y z ");
+    }
+
+    #[test]
+    fn client_message_field_prefix_needs_a_word_boundary() {
+        let errors = ValidationErrors::new(vec![
+            ValidationError::new("a", "age is invalid"),
+            ValidationError::new("", "anything"),
+            ValidationError::new("age", "age is invalid"),
+        ]);
+        assert_eq!(
+            errors.client_message(),
+            "a: age is invalid; : anything; age is invalid"
+        );
     }
 
     #[test]

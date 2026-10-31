@@ -19,6 +19,7 @@
 //! * the numeric validators must never accept a NaN or an infinity, read here
 //!   from the input's leading bytes as both an `f64` and an `f32`;
 //! * `Matches::full` must anchor to the whole value;
+//! * `ValidationPipe::parse_strict` must not panic on any `Content-Type`;
 //! * `IsAlpha`, `IsAlphanumeric` and `IsNumeric` must agree with Rust's own
 //!   character classification, and must not disagree with each other;
 //! * `MinLength` and `MaxLength` must bound `char`s rather than bytes, which
@@ -159,6 +160,26 @@ fuzz_target!(|data: &[u8]| {
                     .is_some_and(|h| h.iter().all(u8::is_ascii_hexdigit))),
             "IsUrl accepted {value:?}, which has a malformed percent-escape",
         );
+    }
+
+    // `parse_strict` reads a client-supplied header: arbitrary text there must
+    // be a 415 or a parse result, never a panic.
+    {
+        struct Dto;
+        impl<'de> serde::Deserialize<'de> for Dto {
+            fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+                serde::de::IgnoredAny::deserialize(d).map(|_| Dto)
+            }
+        }
+        impl armature_validation::Validate for Dto {
+            fn validate(&self) -> Result<(), Vec<armature_validation::ValidationError>> {
+                Ok(())
+            }
+        }
+        let mut req = armature_core::HttpRequest::new("POST", "/".to_string());
+        req.headers.insert("content-type", value);
+        req.body = armature_core::Bytes::from_static(b"{}");
+        let _ = armature_validation::ValidationPipe::parse_strict::<Dto>(&req);
     }
 
     // `Matches::full` anchors to the whole value: the escaped value matches

@@ -47,7 +47,8 @@ Earlier changes are recorded in the workspace [`CHANGELOG.md`](https://github.co
   no userinfo, a host within DNS length limits, and a host, port and remainder
   the parser left unchanged; port 0 and a path beginning with `//` (a
   protocol-relative open redirect when the path is used on its own) are also
-  rejected. Documented as a syntax check, not an SSRF filter.
+  rejected, as is a second `#` (RFC 3986 allows none inside a fragment).
+  Documented as a syntax check, not an SSRF filter.
   Previously-accepted inputs that are now **rejected** (breaking): non-ASCII
   hosts or paths (give hosts in `xn--` form and percent-encode paths);
   characters the parser encodes, such as `'` in a query or `` ` ``, `{`, `|`,
@@ -98,13 +99,14 @@ Earlier changes are recorded in the workspace [`CHANGELOG.md`](https://github.co
 ### Changed
 
 - `Matches::new` caches compiled patterns (up to 256 patterns of at most 1 KiB
-  source and 256 KiB compiled, evicting one entry per insertion when full), so the derive's `regex`
+  source and 256 KiB compiled, with lazy-DFA caches capped at 256 KiB, evicting
+  one entry per insertion when full), so the derive's `regex`
   rule, which builds a `Matches` on every `validate()` call, no longer
   recompiles the pattern per request.
 - `ValidationErrors::client_message` does not repeat the field name when the
-  message already starts with it, lists at most 20 errors, and replaces
-  control characters with spaces so a caller-written field or message cannot
-  break the line.
+  message already names it, lists at most 20 errors, and replaces control,
+  line/paragraph-separator and bidi-override characters with spaces so a
+  caller-written field or message cannot break the line.
 - `ValidationContext`'s `Debug` lists keys only, not the request data.
 - `MaxLength` stops counting once the limit is exceeded.
 - Dependencies: `once_cell` replaced by `std::sync::LazyLock`; `tokio` trimmed

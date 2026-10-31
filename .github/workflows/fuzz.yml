@@ -39,8 +39,6 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           workspaces: fuzz
-      # Pinned like the actions above: an unpinned install runs whatever was
-      # published most recently, with this job's checkout in reach.
       # Keep the corpus between runs: 60 seconds from an empty corpus every
       # time never gets past the shallow inputs. Saved under a per-run key and
       # restored from the newest, so it accumulates.
@@ -49,6 +47,8 @@ jobs:
           path: fuzz/corpus/${{ matrix.target }}
           key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
           restore-keys: fuzz-corpus-${{ matrix.target }}-
+      # Pinned like the actions above: an unpinned install runs whatever was
+      # published most recently, with this job's checkout in reach.
       - run: cargo install cargo-fuzz --locked --version 0.13.2
       # `fuzz/` is its own workspace, so the crate's own clippy run never sees
       # it. Without this the harnesses are the one part of the tree outside the
