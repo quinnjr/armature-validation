@@ -168,8 +168,18 @@ fn nested_validation_recurses() {
     };
     let errors = bad.validate().unwrap_err();
     let fields: Vec<&str> = errors.iter().map(|e| e.field.as_str()).collect();
-    assert!(fields.contains(&"city"), "{fields:?}");
-    assert!(fields.contains(&"state"), "{fields:?}");
+    // `armature-proc-macro` 0.6 reports a nested error under the child's
+    // field name; 0.7 prefixes the parent's (`address.city`). Either way the
+    // error must name the failing child field, and nothing else.
+    for child in ["city", "state"] {
+        assert!(
+            fields
+                .iter()
+                .any(|f| *f == child || *f == format!("address.{child}")),
+            "{fields:?}"
+        );
+    }
+    assert_eq!(fields.len(), 2, "{fields:?}");
 }
 
 /// End to end through the derive: a rejected password, including one the
