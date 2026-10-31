@@ -9,10 +9,10 @@
 use crate::ValidationError;
 use regex::Regex;
 use std::cmp::Ordering;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
-use std::sync::{Condvar, LazyLock, Mutex, RwLock};
+use std::sync::{Arc, LazyLock, Mutex, OnceLock, RwLock};
 
 /// RFC 5322 `dot-atom` local part, `@`, then a hostname.
 ///
@@ -639,77 +639,72 @@ impl<T: Numeric> InRange<T> {
 
 /// Compiled patterns, keyed by `(anchored, source)`, so that a pattern built
 /// per call (as `#[derive(Validate)]`'s `regex` rule does on every
-/// `validate()`) is compiled once rather than on every request.
+/// `validate()`) is compiled once rather than on every request. A pattern
+/// that fails to compile is cached too, with its error, so a bad pattern is
+/// not recompiled per request either.
 ///
 /// Bounded by a byte budget, [`CACHE_BUDGET`], and an entry count,
-/// [`CACHE_ENTRIES`]. Each entry is weighed at 1.25 × the smallest of
-/// [`SIZE_CLASSES`] its compiled program fits under: the class limits the
-/// NFAs, and the one-pass DFA and prefilters add up to about another tenth,
-/// so the budget is approximate. A pattern over the largest class is
-/// compiled under the `regex` crate's default limit and weighed at that. Unicode classes make large
-/// programs common: `^[\w.-]{3,32}$` compiles to about 2 MiB. Every entry's
-/// lazy-DFA cache (one per thread using it) is capped at [`CACHE_DFA`], so
-/// the worst case is about [`CACHE_BUDGET`] plus `threads × CACHE_ENTRIES ×
-/// CACHE_DFA` of search caches, reached only by an application compiling
-/// hundreds of distinct large patterns.
+/// [`CACHE_ENTRIES`]. Each compiled entry is weighed at the smallest of
+/// [`SIZE_CLASSES`] its program compiles within (heap use measures at or
+/// below the class), or at the `regex` crate's default limit if it needs
+/// more; an error is weighed at [`ERROR_WEIGHT`]. Unicode classes make large
+/// programs common: `^[\w.-]{3,32}$` is in the 2 MiB class and
+/// `^\w{1,64}$` in the 4 MiB one, so the budget holds 64–128 such patterns;
+/// `^[\w ]{1,100}$` needs more than 4 MiB and is weighed at 10 MiB. Each
+/// entry's lazy-DFA search cache (one per thread that uses it, up to the
+/// `regex` default of about 2 MiB) is not counted: capping it would make
+/// unanchored Unicode searches tens of times slower.
 ///
 /// Eviction is CLOCK (second chance): a lookup marks its entry referenced,
-/// and the eviction hand skips, and clears, referenced entries. A working
-/// set that fits stays cached while a burst of one-off patterns (e.g. ones
-/// built from request data) cycles through the unreferenced slots.
+/// the eviction hand skips and clears referenced entries, and a new entry is
+/// placed behind the hand. A working set that fits stays cached while a
+/// burst of one-off patterns (e.g. ones built from request data) cycles
+/// through the unreferenced slots. A working set cycled in order and larger
+/// than the cache misses on every call, as with any CLOCK or LRU cache.
 ///
 /// A source longer than [`MAX_PATTERN`] is never cached.
 static MATCHES_CACHE: LazyLock<RwLock<PatternCache>> = LazyLock::new(Default::default);
 const MAX_PATTERN: usize = 1024;
 const CACHE_ENTRIES: usize = 512;
 const CACHE_BUDGET: usize = 256 * 1024 * 1024;
-const CACHE_DFA: usize = 256 * 1024;
-const SIZE_CLASSES: [usize; 3] = [256 * 1024, 2 * 1024 * 1024, 8 * 1024 * 1024];
+const SIZE_CLASSES: [usize; 4] = [256 * 1024, 1024 * 1024, 2 * 1024 * 1024, 4 * 1024 * 1024];
 /// `regex`'s default `size_limit`, the weight of a pattern over every class.
 const DEFAULT_COMPILED: usize = 10 * 1024 * 1024;
+const ERROR_WEIGHT: usize = 4 * 1024;
 
-/// Patterns being compiled for the cache. A caller that misses on a pattern
-/// already here waits on [`MATCHES_INFLIGHT_DONE`] and then finds it cached.
-static MATCHES_INFLIGHT: LazyLock<Mutex<HashSet<PatternKey>>> = LazyLock::new(Default::default);
-static MATCHES_INFLIGHT_DONE: Condvar = Condvar::new();
+type PatternKey = (bool, String);
+type Compiled = Result<Regex, regex::Error>;
 
-/// Marks a pattern as being compiled; dropping it, on any path, unmarks it
-/// and wakes waiters.
-struct InFlight(PatternKey);
+/// Compiles in progress. The first caller to miss on a pattern compiles it;
+/// concurrent callers wait on its slot and share the result, success or
+/// error, rather than repeating the compile.
+static MATCHES_INFLIGHT: LazyLock<Mutex<HashMap<PatternKey, Arc<OnceLock<Compiled>>>>> =
+    LazyLock::new(Default::default);
 
-impl InFlight {
-    fn enter(key: &PatternKey) -> Self {
-        let mut inflight = MATCHES_INFLIGHT.lock().unwrap_or_else(|e| e.into_inner());
-        while inflight.contains(key) {
-            inflight = MATCHES_INFLIGHT_DONE
-                .wait(inflight)
-                .unwrap_or_else(|e| e.into_inner());
-        }
-        inflight.insert(key.clone());
-        Self(key.clone())
-    }
+/// Held by the caller compiling a pattern. On drop, on any path, it fills
+/// the slot if the compile did not (so waiters never hang) and retires it.
+struct Leader {
+    key: PatternKey,
+    slot: Arc<OnceLock<Compiled>>,
 }
 
-impl Drop for InFlight {
+impl Drop for Leader {
     fn drop(&mut self) {
+        let _ = self.slot.set(Err(regex::Error::Syntax(
+            "pattern compilation did not complete".to_string(),
+        )));
         MATCHES_INFLIGHT
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .remove(&self.0);
-        MATCHES_INFLIGHT_DONE.notify_all();
+            .remove(&self.key);
     }
 }
 
-/// An entry's budget weight for a program within `limit`; see
-/// [`MATCHES_CACHE`].
-const fn weigh(limit: usize) -> usize {
-    limit + limit / 4
-}
-
-type PatternKey = (bool, String);
+#[cfg(test)]
+static COMPILES: LazyLock<Mutex<HashMap<PatternKey, usize>>> = LazyLock::new(Default::default);
 
 struct CacheEntry {
-    regex: Regex,
+    compiled: Compiled,
     weight: usize,
     referenced: AtomicBool,
 }
@@ -724,17 +719,22 @@ struct PatternCache {
 }
 
 impl PatternCache {
-    fn get(&self, key: &PatternKey) -> Option<Regex> {
+    fn get(&self, key: &PatternKey) -> Option<Compiled> {
         self.entries.get(key).map(|entry| {
             entry.referenced.store(true, AtomicOrdering::Relaxed);
-            entry.regex.clone()
+            entry.compiled.clone()
         })
     }
 
-    fn insert(&mut self, key: PatternKey, regex: Regex, weight: usize) {
+    fn insert(&mut self, key: PatternKey, compiled: Compiled, weight: usize) {
         if let Some(old) = self.entries.remove(&key) {
             self.weight -= old.weight;
-            self.ring.retain(|k| k != &key);
+            if let Some(at) = self.ring.iter().position(|k| k == &key) {
+                self.ring.remove(at);
+                if at < self.hand {
+                    self.hand -= 1;
+                }
+            }
         }
         while !self.ring.is_empty()
             && (self.entries.len() >= CACHE_ENTRIES || self.weight + weight > CACHE_BUDGET)
@@ -762,7 +762,7 @@ impl PatternCache {
         self.entries.insert(
             key,
             CacheEntry {
-                regex,
+                compiled,
                 weight,
                 referenced: AtomicBool::new(false),
             },
@@ -806,73 +806,94 @@ impl Matches {
     /// Compile `pattern` (anchored to the whole value if `full`), through the
     /// cache. Anchored entries are keyed separately from plain ones, so an
     /// anchored form only ever comes out of the cache via [`Matches::full`],
-    /// which checked the bare pattern before inserting it.
+    /// which checked the bare pattern before compiling it.
     fn cached_compile(full: bool, pattern: &str) -> Result<Self, regex::Error> {
         let key = (full, pattern.to_owned());
-        if let Some(regex) = MATCHES_CACHE
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(&key)
-        {
-            return Ok(Self(regex));
+        let cached = || {
+            MATCHES_CACHE
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&key)
+        };
+        if let Some(compiled) = cached() {
+            return compiled.map(Self);
         }
-        // Single flight: concurrent misses on one pattern wait for the first
-        // compile instead of each repeating it.
-        let _flight = (pattern.len() <= MAX_PATTERN).then(|| InFlight::enter(&key));
-        if let Some(regex) = MATCHES_CACHE
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(&key)
+        if pattern.len() > MAX_PATTERN {
+            return Self::compile(full, pattern).0.map(Self);
+        }
+        let slot = {
+            let mut inflight = MATCHES_INFLIGHT.lock().unwrap_or_else(|e| e.into_inner());
+            match inflight.get(&key) {
+                Some(slot) => Err(Arc::clone(slot)),
+                None => {
+                    let slot = Arc::new(OnceLock::new());
+                    inflight.insert(key.clone(), Arc::clone(&slot));
+                    Ok(slot)
+                }
+            }
+        };
+        let slot = match slot {
+            Ok(slot) => slot,
+            // Another caller is compiling it: share its result.
+            Err(slot) => return slot.wait().clone().map(Self),
+        };
+        let leader = Leader {
+            key: key.clone(),
+            slot,
+        };
+        // A leader that finished between the first lookup and taking the
+        // slot has already cached the result.
+        let compiled = match cached() {
+            Some(compiled) => compiled,
+            None => {
+                let (compiled, weight) = Self::compile(full, pattern);
+                MATCHES_CACHE
+                    .write()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(key, compiled.clone(), weight);
+                compiled
+            }
+        };
+        let _ = leader.slot.set(compiled.clone());
+        drop(leader);
+        compiled.map(Self)
+    }
+
+    /// Compile without the cache, returning the result and its cache weight.
+    ///
+    /// The smallest size class the program fits sets its weight. A failed
+    /// attempt stops once it exceeds its limit, and the limits roughly double,
+    /// so a miss on a large pattern costs under twice a plain compile.
+    fn compile(full: bool, pattern: &str) -> (Compiled, usize) {
+        #[cfg(test)]
         {
-            return Ok(Self(regex));
+            *COMPILES
+                .lock()
+                .unwrap()
+                .entry((full, pattern.to_owned()))
+                .or_default() += 1;
         }
         let source = if full {
             // Parsing is enough to reject an unbalanced pattern, and far
             // cheaper than compiling it.
-            regex_syntax::Parser::new()
-                .parse(pattern)
-                .map_err(|e| regex::Error::Syntax(e.to_string()))?;
+            if let Err(e) = regex_syntax::Parser::new().parse(pattern) {
+                return (Err(regex::Error::Syntax(e.to_string())), ERROR_WEIGHT);
+            }
             format!(r"\A(?:{pattern})\z")
         } else {
             pattern.to_owned()
         };
-        if pattern.len() > MAX_PATTERN {
-            return Ok(Self(Regex::new(&source)?));
-        }
-        // The smallest size class the program fits sets its cache weight. A
-        // failed attempt stops once it exceeds its limit, but still costs up
-        // to that limit's worth of compiling: with three classes a miss on a
-        // large pattern costs about twice to two and a half times a plain
-        // compile.
-        let mut compiled = None;
         for limit in SIZE_CLASSES {
-            match regex::RegexBuilder::new(&source)
-                .size_limit(limit)
-                .dfa_size_limit(CACHE_DFA)
-                .build()
-            {
-                Ok(regex) => {
-                    compiled = Some((regex, weigh(limit)));
-                    break;
-                }
+            match regex::RegexBuilder::new(&source).size_limit(limit).build() {
+                Ok(regex) => return (Ok(regex), limit),
                 Err(regex::Error::CompiledTooBig(_)) => continue,
-                Err(e) => return Err(e),
+                Err(e) => return (Err(e), ERROR_WEIGHT),
             }
         }
-        let (regex, weight) = match compiled {
-            Some(found) => found,
-            None => (
-                regex::RegexBuilder::new(&source)
-                    .dfa_size_limit(CACHE_DFA)
-                    .build()?,
-                weigh(DEFAULT_COMPILED),
-            ),
-        };
-        MATCHES_CACHE
-            .write()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(key, regex.clone(), weight);
-        Ok(Self(regex))
+        match Regex::new(&source) {
+            Ok(regex) => (Ok(regex), DEFAULT_COMPILED),
+            Err(e) => (Err(e), ERROR_WEIGHT),
+        }
     }
 
     #[cfg(test)]
@@ -881,7 +902,17 @@ impl Matches {
             .read()
             .unwrap_or_else(|e| e.into_inner())
             .get(&(full, pattern.to_owned()))
-            .is_some()
+            .is_some_and(|c| c.is_ok())
+    }
+
+    #[cfg(test)]
+    fn compiles(full: bool, pattern: &str) -> usize {
+        COMPILES
+            .lock()
+            .unwrap()
+            .get(&(full, pattern.to_owned()))
+            .copied()
+            .unwrap_or(0)
     }
 
     pub fn validate(&self, value: &str, field: &str) -> Result<(), ValidationError> {
@@ -1422,14 +1453,14 @@ mod tests {
         let regex = Regex::new("x").unwrap();
         let mut cache = PatternCache::default();
         for i in 0..(CACHE_ENTRIES + 50) {
-            cache.insert((false, format!("s{i}")), regex.clone(), SIZE_CLASSES[0]);
+            cache.insert((false, format!("s{i}")), Ok(regex.clone()), SIZE_CLASSES[0]);
         }
         assert_eq!(cache.entries.len(), CACHE_ENTRIES);
         for i in 0..100 {
             cache.insert(
                 (false, format!("l{i}")),
-                regex.clone(),
-                weigh(DEFAULT_COMPILED),
+                Ok(regex.clone()),
+                DEFAULT_COMPILED,
             );
         }
         assert!(cache.weight <= CACHE_BUDGET, "weight {}", cache.weight);
@@ -1445,19 +1476,23 @@ mod tests {
         let regex = Regex::new("x").unwrap();
         let mut cache = PatternCache::default();
         for i in 0..CACHE_ENTRIES {
-            cache.insert((false, format!("fill{i}")), regex.clone(), SIZE_CLASSES[0]);
+            cache.insert(
+                (false, format!("fill{i}")),
+                Ok(regex.clone()),
+                SIZE_CLASSES[0],
+            );
         }
         let late = (false, "late".to_string());
         let mut misses = 0;
         for round in 0..50 {
             if cache.get(&late).is_none() {
                 misses += 1;
-                cache.insert(late.clone(), regex.clone(), SIZE_CLASSES[0]);
+                cache.insert(late.clone(), Ok(regex.clone()), SIZE_CLASSES[0]);
             }
             for k in 0..10 {
                 cache.insert(
                     (false, format!("cold{round}-{k}")),
-                    regex.clone(),
+                    Ok(regex.clone()),
                     SIZE_CLASSES[0],
                 );
             }
@@ -1477,8 +1512,24 @@ mod tests {
             assert!(t.join().unwrap().validate("single-flight-abc", "f").is_ok());
         }
         assert!(Matches::cached(false, pattern));
+        assert_eq!(Matches::compiles(false, pattern), 1);
         let key = (false, pattern.to_owned());
-        assert!(!MATCHES_INFLIGHT.lock().unwrap().contains(&key));
+        assert!(!MATCHES_INFLIGHT.lock().unwrap().contains_key(&key));
+    }
+
+    /// A pattern that fails to compile is compiled once too: concurrent
+    /// callers share the error, and later ones get it from the cache.
+    #[test]
+    fn matches_cache_shares_and_keeps_errors() {
+        let pattern = "(unclosed-shared";
+        let threads: Vec<_> = (0..8)
+            .map(|_| std::thread::spawn(move || Matches::new(pattern).is_err()))
+            .collect();
+        for t in threads {
+            assert!(t.join().unwrap());
+        }
+        assert!(Matches::new(pattern).is_err());
+        assert_eq!(Matches::compiles(false, pattern), 1);
     }
 
     /// A working set that fits survives a stream of one-off patterns: CLOCK
@@ -1489,13 +1540,17 @@ mod tests {
         let mut cache = PatternCache::default();
         let hot: Vec<PatternKey> = (0..20).map(|i| (false, format!("hot{i}"))).collect();
         for key in &hot {
-            cache.insert(key.clone(), regex.clone(), 4 * 1024 * 1024);
+            cache.insert(key.clone(), Ok(regex.clone()), 4 * 1024 * 1024);
         }
         for i in 0..1000 {
             for key in &hot {
                 assert!(cache.get(key).is_some(), "hot entry {key:?} evicted at {i}");
             }
-            cache.insert((false, format!("cold{i}")), regex.clone(), 4 * 1024 * 1024);
+            cache.insert(
+                (false, format!("cold{i}")),
+                Ok(regex.clone()),
+                4 * 1024 * 1024,
+            );
         }
     }
 

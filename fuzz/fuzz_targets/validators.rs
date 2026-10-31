@@ -79,6 +79,37 @@ fuzz_target!(|data: &[u8]| {
         );
     }
 
+    // `parse_strict` reads a client-supplied header: arbitrary bytes there
+    // must be a 415 or a parse result, never a panic, and the verdict must
+    // match an independent statement of "a single JSON media type".
+    {
+        struct Dto;
+        impl<'de> serde::Deserialize<'de> for Dto {
+            fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+                serde::de::IgnoredAny::deserialize(d).map(|_| Dto)
+            }
+        }
+        impl armature_validation::Validate for Dto {
+            fn validate(&self) -> Result<(), Vec<armature_validation::ValidationError>> {
+                Ok(())
+            }
+        }
+        // A newline splits the input into two header lines, as a client
+        // sending the field twice would.
+        let lines: Vec<&[u8]> = data.splitn(2, |&b| b == b'\n').collect();
+        let mut req = armature_core::HttpRequest::new("POST", "/".to_string());
+        for line in &lines {
+            req.headers.append("content-type", *line);
+        }
+        req.body = armature_core::Bytes::from_static(b"{}");
+        let accepted = armature_validation::ValidationPipe::parse_strict::<Dto>(&req).is_ok();
+        let expected = lines.len() == 1 && is_json_media_type(lines[0]);
+        assert_eq!(
+            accepted, expected,
+            "parse_strict on Content-Type {lines:?}: accepted {accepted}, expected {expected}",
+        );
+    }
+
     let Ok(value) = std::str::from_utf8(data) else {
         return;
     };
@@ -161,37 +192,6 @@ fuzz_target!(|data: &[u8]| {
                     .get(i + 1..i + 3)
                     .is_some_and(|h| h.iter().all(u8::is_ascii_hexdigit))),
             "IsUrl accepted {value:?}, which has a malformed percent-escape",
-        );
-    }
-
-    // `parse_strict` reads a client-supplied header: arbitrary bytes there
-    // must be a 415 or a parse result, never a panic, and the verdict must
-    // match an independent statement of "a single JSON media type".
-    {
-        struct Dto;
-        impl<'de> serde::Deserialize<'de> for Dto {
-            fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-                serde::de::IgnoredAny::deserialize(d).map(|_| Dto)
-            }
-        }
-        impl armature_validation::Validate for Dto {
-            fn validate(&self) -> Result<(), Vec<armature_validation::ValidationError>> {
-                Ok(())
-            }
-        }
-        // A newline splits the input into two header lines, as a client
-        // sending the field twice would.
-        let lines: Vec<&[u8]> = data.splitn(2, |&b| b == b'\n').collect();
-        let mut req = armature_core::HttpRequest::new("POST", "/".to_string());
-        for line in &lines {
-            req.headers.append("content-type", *line);
-        }
-        req.body = armature_core::Bytes::from_static(b"{}");
-        let accepted = armature_validation::ValidationPipe::parse_strict::<Dto>(&req).is_ok();
-        let expected = lines.len() == 1 && is_json_media_type(lines[0]);
-        assert_eq!(
-            accepted, expected,
-            "parse_strict on Content-Type {lines:?}: accepted {accepted}, expected {expected}",
         );
     }
 
