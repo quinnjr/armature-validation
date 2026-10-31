@@ -179,7 +179,27 @@ fuzz_target!(|data: &[u8]| {
         let mut req = armature_core::HttpRequest::new("POST", "/".to_string());
         req.headers.insert("content-type", value);
         req.body = armature_core::Bytes::from_static(b"{}");
-        let _ = armature_validation::ValidationPipe::parse_strict::<Dto>(&req);
+        let accepted = armature_validation::ValidationPipe::parse_strict::<Dto>(&req).is_ok();
+        // Accepted means a JSON media type, stated without the validator's
+        // byte-level parsing: ASCII, `application/` then a subtype ending in
+        // `json` (`json` itself or `…+json`), no spaces inside.
+        if accepted {
+            let media = value
+                .split(';')
+                .next()
+                .unwrap_or("")
+                .trim_matches([' ', '\t']);
+            let lower = media.to_ascii_lowercase();
+            let sub = lower.strip_prefix("application/").unwrap_or_else(|| {
+                panic!("parse_strict accepted Content-Type {value:?}, not application/*")
+            });
+            assert!(
+                media.is_ascii()
+                    && !sub.contains([' ', '\t', '/', '"'])
+                    && (sub == "json" || (sub.len() > 5 && sub.ends_with("+json"))),
+                "parse_strict accepted Content-Type {value:?}",
+            );
+        }
     }
 
     // `Matches::full` anchors to the whole value: the escaped value matches

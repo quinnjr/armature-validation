@@ -53,15 +53,12 @@ impl ValidationPipe {
     where
         T: DeserializeOwned + Validate,
     {
-        // Compared as bytes: the header is client input and need not be
-        // ASCII, so slicing it as a `str` at a byte offset could panic.
-        let is_json = req.headers.get("content-type").is_some_and(|ct| {
-            let media = ct.split(';').next().unwrap_or("").trim().as_bytes();
-            media.eq_ignore_ascii_case(b"application/json")
-                || (media.len() > b"application/+json".len()
-                    && media[..12].eq_ignore_ascii_case(b"application/")
-                    && media[media.len() - 5..].eq_ignore_ascii_case(b"+json"))
-        });
+        // A duplicated header is refused rather than resolved: which copy
+        // wins depends on who appended it.
+        let is_json = matches!(
+            req.headers.get_unique("content-type"),
+            Ok(Some(value)) if is_json_media_type(value)
+        );
         if !is_json {
             return Err(Error::UnsupportedMediaType(
                 "expected a JSON Content-Type".to_string(),
@@ -84,6 +81,34 @@ impl ValidationPipe {
             errors.to_json().to_string().into_bytes(),
         )
     }
+}
+
+/// Whether a `Content-Type` value names `application/json` or an
+/// `application/*+json` type.
+///
+/// Works on bytes, since the header is client input and need not be ASCII.
+/// Only HTTP whitespace (SP, HTAB) is trimmed, and the subtype must be an
+/// RFC 9110 token, so lookalikes with Unicode spaces or quotes do not pass.
+fn is_json_media_type(value: &[u8]) -> bool {
+    fn is_tchar(b: &u8) -> bool {
+        b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(b)
+    }
+    let media = value.split(|&b| b == b';').next().unwrap_or_default();
+    let start = media.iter().position(|b| !matches!(b, b' ' | b'\t'));
+    let end = media.iter().rposition(|b| !matches!(b, b' ' | b'\t'));
+    let (Some(start), Some(end)) = (start, end) else {
+        return false;
+    };
+    let media = &media[start..=end];
+    let Some(slash) = media.iter().position(|&b| b == b'/') else {
+        return false;
+    };
+    let (ty, sub) = (&media[..slash], &media[slash + 1..]);
+    ty.eq_ignore_ascii_case(b"application")
+        && !sub.is_empty()
+        && sub.iter().all(is_tchar)
+        && (sub.eq_ignore_ascii_case(b"json")
+            || (sub.len() > 5 && sub[sub.len() - 5..].eq_ignore_ascii_case(b"+json")))
 }
 
 /// The client-safe `Error` for a failed validation; shared with [`validate!`].
@@ -233,6 +258,13 @@ mod tests {
             (Some("application/+json"), false),
             (Some("text/+json"), false),
             (Some("application/aaaa\u{20AC}\u{20AC}"), false),
+            (Some("application/ +json"), false),
+            (Some("application/a b+json"), false),
+            (Some("application/\"x\"+json"), false),
+            (Some("application/json\u{00A0}"), false),
+            (Some("\tapplication/json "), true),
+            (Some(""), false),
+            (Some(" "), false),
             (Some("\u{20AC}\u{20AC}\u{20AC}\u{20AC}\u{20AC}+json"), false),
         ] {
             let mut req = request(body);
@@ -245,6 +277,17 @@ mod tests {
                 assert!(matches!(result, Err(Error::UnsupportedMediaType(_))));
             }
         }
+    }
+
+    #[test]
+    fn parse_strict_rejects_duplicate_content_type() {
+        let mut req = request(r#"{"name":"x","age":1}"#);
+        req.headers.append("content-type", "application/json");
+        req.headers.append("content-type", "text/plain");
+        assert!(matches!(
+            ValidationPipe::parse_strict::<TestDto>(&req),
+            Err(Error::UnsupportedMediaType(_))
+        ));
     }
 
     #[test]

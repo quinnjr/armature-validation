@@ -47,7 +47,8 @@ Earlier changes are recorded in the workspace [`CHANGELOG.md`](https://github.co
   no userinfo, a host within DNS length limits, and a host, port and remainder
   the parser left unchanged; port 0 and a path beginning with `//` (a
   protocol-relative open redirect when the path is used on its own) are also
-  rejected, as is a second `#` (RFC 3986 allows none inside a fragment).
+  rejected, as are a second `#` (RFC 3986 allows none inside a fragment) and
+  `[`/`]` outside an IP-literal host.
   Documented as a syntax check, not an SSRF filter.
   Previously-accepted inputs that are now **rejected** (breaking): non-ASCII
   hosts or paths (give hosts in `xn--` form and percent-encode paths);
@@ -92,27 +93,32 @@ Earlier changes are recorded in the workspace [`CHANGELOG.md`](https://github.co
   documented.
 - `ValidationErrors::to_json_with_values` and `client_message`.
 - `IsNumeric` and `IsUuid` in the prelude.
-- `ValidationPipe::parse_strict`, which also requires a JSON `Content-Type`
-  (415 otherwise), for cookie-authenticated endpoints that a cross-site
+- `ValidationPipe::parse_strict`, which also requires a single JSON
+  `Content-Type` (`application/json` or `application/<token>+json`; 415
+  otherwise), for cookie-authenticated endpoints that a cross-site
   `text/plain` form post could otherwise reach.
 
 ### Changed
 
-- `Matches::new` caches compiled patterns: up to 256 that compile within
-  256 KiB (lazy-DFA caches capped at 256 KiB), plus up to 16 larger ones such
-  as Unicode `[\w.-]{3,32}`; sources over 1 KiB are not cached, and a full
-  tier evicts one entry per insertion, so the derive's `regex`
+- `Matches::new` and `Matches::full` cache compiled patterns, bounded at 512
+  entries and 256 MiB of compiled program (each entry weighed by the
+  power-of-two size class it fits, so Unicode patterns such as
+  `[\w.-]{3,32}`, about 2 MiB, are cached too), with lazy-DFA caches capped
+  at 256 KiB per thread and CLOCK eviction that keeps recently used patterns;
+  sources over 1 KiB are not cached, so the derive's `regex`
   rule, which builds a `Matches` on every `validate()` call, no longer
   recompiles the pattern per request.
 - `ValidationErrors::client_message` does not repeat the field name when the
-  message already names it, lists at most 20 errors, and replaces control,
-  line/paragraph-separator and bidi-override characters with spaces so a
-  caller-written field or message cannot break the line.
+  message already names it, lists at most 20 errors of at most 200 characters
+  each, and replaces control, line/paragraph-separator and bidi formatting
+  characters with spaces so a caller-written field or message cannot break
+  the line.
 - `ValidationContext`'s `Debug` lists keys only, not the request data.
 - `MaxLength` stops counting once the limit is exceeded.
 - Dependencies: `once_cell` replaced by `std::sync::LazyLock`; `tokio` trimmed
   to the `rt` feature (`macros` moved to dev-dependencies); `serde`'s `derive`
-  feature moved to dev-dependencies.
+  feature moved to dev-dependencies; `regex-syntax` 0.8 is a direct dependency
+  (used by `Matches::full`).
 - The published package is limited to the library, tests, benches and docs
   (no CI, fuzz or hook configuration).
 

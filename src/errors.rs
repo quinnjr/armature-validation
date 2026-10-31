@@ -163,12 +163,19 @@ impl ValidationErrors {
                 // empty field name does not.
                 let names_field = !e.field.is_empty()
                     && e.message.strip_prefix(&e.field).is_some_and(|rest| {
-                        rest.chars().next().is_none_or(|c| !c.is_alphanumeric() && c != '_')
+                        rest.chars()
+                            .next()
+                            .is_none_or(|c| !c.is_alphanumeric() && c != '_')
                     });
-                if names_field {
+                let text = if names_field {
                     e.message.clone()
                 } else {
                     e.to_string()
+                };
+                // A caller-written message has no length limit of its own.
+                match text.char_indices().nth(Self::CLIENT_MESSAGE_MAX_CHARS) {
+                    Some((cut, _)) => format!("{}…", &text[..cut]),
+                    None => text,
                 }
             })
             .collect::<Vec<_>>()
@@ -176,7 +183,19 @@ impl ValidationErrors {
             // One line: a control character in a caller-written field or
             // message must not start a new log line or header.
             .replace(
-                |c: char| c.is_control() || matches!(c, '\u{2028}' | '\u{2029}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}'),
+                |c: char| {
+                    c.is_control()
+                        || matches!(
+                            c,
+                            '\u{061C}'
+                                | '\u{200E}'
+                                | '\u{200F}'
+                                | '\u{2028}'
+                                | '\u{2029}'
+                                | '\u{202A}'..='\u{202E}'
+                                | '\u{2066}'..='\u{2069}'
+                        )
+                },
                 " ",
             );
         if self.errors.len() > shown {
@@ -187,6 +206,10 @@ impl ValidationErrors {
 
     /// The most errors [`client_message`](Self::client_message) lists.
     pub const CLIENT_MESSAGE_MAX_ERRORS: usize = 20;
+
+    /// The most characters [`client_message`](Self::client_message) keeps of
+    /// each error's text.
+    pub const CLIENT_MESSAGE_MAX_CHARS: usize = 200;
 }
 
 impl fmt::Display for ValidationErrors {
@@ -240,9 +263,9 @@ mod tests {
     fn client_message_is_one_line() {
         let errors = ValidationErrors::new(vec![ValidationError::new(
             "a\r\nb",
-            "x\ny\u{2028}z\u{202E}",
+            "x\ny\u{2028}z\u{202E}\u{200F}",
         )]);
-        assert_eq!(errors.client_message(), "a  b: x y z ");
+        assert_eq!(errors.client_message(), "a  b: x y z  ");
     }
 
     #[test]
@@ -256,6 +279,17 @@ mod tests {
             errors.client_message(),
             "a: age is invalid; : anything; age is invalid"
         );
+    }
+
+    #[test]
+    fn client_message_truncates_long_messages() {
+        let errors = ValidationErrors::new(vec![ValidationError::new("f", "x".repeat(1000))]);
+        let message = errors.client_message();
+        assert_eq!(
+            message.chars().count(),
+            ValidationErrors::CLIENT_MESSAGE_MAX_CHARS + 1
+        );
+        assert!(message.ends_with('…'));
     }
 
     #[test]
