@@ -143,6 +143,10 @@
 //! assert_eq!(validator.name(), "IsStrongPassword");
 //! ```
 
+// Lets `#[derive(Validate)]`, whose generated code names this crate as
+// `::armature_validation`, also be used inside the crate itself.
+extern crate self as armature_validation;
+
 mod errors;
 mod pipe;
 mod rules;
