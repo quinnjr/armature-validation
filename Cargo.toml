@@ -15,7 +15,10 @@ categories = ["web-programming"]
 include = ["src/**", "tests/**", "benches/**", "README.md", "CHANGELOG.md", "LICENSE"]
 
 [dependencies]
-armature-core = { version = "0.12" }
+# Without default features: core's `h1-backend` default selects the server
+# implementation, and an application that chose the other one must not have
+# it switched back just by depending on this crate.
+armature-core = { version = "0.12", default-features = false }
 armature-proc-macro = { version = "0.6" }
 serde = "1.0"
 serde_json = "1.0"

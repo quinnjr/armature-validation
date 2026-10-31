@@ -7,6 +7,9 @@ updates:
     schedule:
       interval: "weekly"
       day: "monday"
+    # A release has a week to be yanked or flagged before it is proposed.
+    cooldown:
+      default-days: 7
     open-pull-requests-limit: 10
     commit-message:
       prefix: "deps(rust)"
@@ -26,6 +29,9 @@ updates:
     schedule:
       interval: "weekly"
       day: "monday"
+    # A release has a week to be yanked or flagged before it is proposed.
+    cooldown:
+      default-days: 7
     commit-message:
       prefix: "deps(fuzz)"
     labels:
@@ -37,6 +43,9 @@ updates:
     schedule:
       interval: "weekly"
       day: "monday"
+    # A release has a week to be yanked or flagged before it is proposed.
+    cooldown:
+      default-days: 7
     commit-message:
       prefix: "deps(actions)"
     labels:

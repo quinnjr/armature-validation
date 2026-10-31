@@ -2,6 +2,35 @@
 
 use std::fmt;
 
+/// Characters that break a line or reorder how it reads: controls, the
+/// line and paragraph separators, and bidi formatting characters.
+fn breaks_line(c: char) -> bool {
+    c.is_control()
+        || matches!(
+            c,
+            '\u{061C}'
+                | '\u{200E}'
+                | '\u{200F}'
+                | '\u{2028}'
+                | '\u{2029}'
+                | '\u{202A}'..='\u{202E}'
+                | '\u{2066}'..='\u{2069}'
+        )
+}
+
+/// `text` on one line: [`breaks_line`] characters become spaces.
+fn one_line(text: &str) -> String {
+    text.replace(breaks_line, " ")
+}
+
+/// `text` cut to `max` characters, marked with `…` if cut.
+fn bounded(text: &str, max: usize) -> String {
+    match text.char_indices().nth(max) {
+        Some((cut, _)) => format!("{}…", &text[..cut]),
+        None => text.to_owned(),
+    }
+}
+
 /// Validation error for a single field
 ///
 /// `Debug` redacts [`value`](Self::value): an error list is routinely logged or
@@ -69,9 +98,12 @@ impl fmt::Debug for ValidationError {
     }
 }
 
+/// `field: message` on one line: characters that would start a new line or
+/// reorder the text are replaced with spaces, since the field and message may
+/// be caller-written and this is what logs print.
 impl fmt::Display for ValidationError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}: {}", self.field, self.message)
+        write!(f, "{}: {}", one_line(&self.field), one_line(&self.message))
     }
 }
 
@@ -138,9 +170,10 @@ impl ValidationErrors {
         let shown = self.errors.len().min(Self::JSON_MAX_ERRORS);
         let mut json = serde_json::json!({
             "errors": self.errors[..shown].iter().map(|e| {
+                // JSON escapes control characters; only length needs bounding.
                 let mut entry = serde_json::json!({
-                    "field": e.field,
-                    "message": e.message,
+                    "field": bounded(&e.field, Self::CLIENT_MESSAGE_MAX_CHARS),
+                    "message": bounded(&e.message, Self::CLIENT_MESSAGE_MAX_CHARS),
                     "constraint": e.constraint,
                 });
                 if with_values && let Some(value) = &e.value {
@@ -184,37 +217,17 @@ impl ValidationErrors {
                             .next()
                             .is_none_or(|c| !c.is_alphanumeric() && c != '_')
                     });
+                // One line (`Display` already is), and bounded: a
+                // caller-written message has no length limit of its own.
                 let text = if names_field {
-                    e.message.clone()
+                    one_line(&e.message)
                 } else {
                     e.to_string()
                 };
-                // A caller-written message has no length limit of its own.
-                match text.char_indices().nth(Self::CLIENT_MESSAGE_MAX_CHARS) {
-                    Some((cut, _)) => format!("{}…", &text[..cut]),
-                    None => text,
-                }
+                bounded(&text, Self::CLIENT_MESSAGE_MAX_CHARS)
             })
             .collect::<Vec<_>>()
-            .join("; ")
-            // One line: a control character in a caller-written field or
-            // message must not start a new log line or header.
-            .replace(
-                |c: char| {
-                    c.is_control()
-                        || matches!(
-                            c,
-                            '\u{061C}'
-                                | '\u{200E}'
-                                | '\u{200F}'
-                                | '\u{2028}'
-                                | '\u{2029}'
-                                | '\u{202A}'..='\u{202E}'
-                                | '\u{2066}'..='\u{2069}'
-                        )
-                },
-                " ",
-            );
+            .join("; ");
         if self.errors.len() > shown {
             message.push_str(&format!(" (and {} more)", self.errors.len() - shown));
         }
@@ -229,10 +242,21 @@ impl ValidationErrors {
     pub const CLIENT_MESSAGE_MAX_CHARS: usize = 200;
 }
 
+/// One line per error (each as [`ValidationError`]'s `Display`), at most
+/// [`JSON_MAX_ERRORS`](ValidationErrors::JSON_MAX_ERRORS) of them, each cut
+/// at [`CLIENT_MESSAGE_MAX_CHARS`](ValidationErrors::CLIENT_MESSAGE_MAX_CHARS).
 impl fmt::Display for ValidationErrors {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        for error in &self.errors {
-            writeln!(f, "{}", error)?;
+        let shown = self.errors.len().min(Self::JSON_MAX_ERRORS);
+        for error in &self.errors[..shown] {
+            writeln!(
+                f,
+                "{}",
+                bounded(&error.to_string(), Self::CLIENT_MESSAGE_MAX_CHARS)
+            )?;
+        }
+        if self.errors.len() > shown {
+            writeln!(f, "(and {} more)", self.errors.len() - shown)?;
         }
         Ok(())
     }
@@ -318,6 +342,31 @@ mod tests {
         );
         let message = many.client_message();
         assert!(message.ends_with("f19: bad (and 80 more)"), "{message}");
+    }
+
+    #[test]
+    fn display_is_one_line_per_error_and_bounded() {
+        let many = ValidationErrors::new(
+            (0..150)
+                .map(|i| ValidationError::new(format!("f{i}\r\n"), "x\u{202E}".repeat(300)))
+                .collect(),
+        );
+        let text = many.to_string();
+        let lines: Vec<_> = text.lines().collect();
+        assert_eq!(lines.len(), ValidationErrors::JSON_MAX_ERRORS + 1);
+        assert_eq!(lines[100], "(and 50 more)");
+        assert!(lines[0].chars().count() <= ValidationErrors::CLIENT_MESSAGE_MAX_CHARS + 1);
+        assert!(!text.contains('\u{202E}') && !text.contains('\r'));
+    }
+
+    #[test]
+    fn to_json_bounds_each_field_and_message() {
+        let errors =
+            ValidationErrors::new(vec![ValidationError::new("f".repeat(500), "m".repeat(500))]);
+        let json = errors.to_json();
+        let entry = &json["errors"][0];
+        assert_eq!(entry["field"].as_str().unwrap().chars().count(), 201);
+        assert_eq!(entry["message"].as_str().unwrap().chars().count(), 201);
     }
 
     #[test]

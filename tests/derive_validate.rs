@@ -171,3 +171,37 @@ fn nested_validation_recurses() {
     assert!(fields.contains(&"city"), "{fields:?}");
     assert!(fields.contains(&"state"), "{fields:?}");
 }
+
+/// End to end through the derive: a rejected password, including one the
+/// derive's own rules record, never reaches the 400 body or the error text.
+#[test]
+fn derived_dto_errors_do_not_echo_submitted_values() {
+    #[derive(serde::Deserialize, Validate)]
+    struct Signup {
+        #[validate(length(min = 12))]
+        password: String,
+        #[validate(range(min = 18, max = 120))]
+        age: u32,
+    }
+
+    let mut req = armature_core::HttpRequest::new("POST", "/signup".to_string());
+    req.body = armature_core::Bytes::from_static(br#"{"password":"hunter2-SECRET","age":7777}"#);
+    let err = armature_validation::ValidationPipe::parse::<Signup>(&req)
+        .err()
+        .expect("both fields fail");
+    for text in [err.client_message(), err.to_string()] {
+        assert!(
+            !text.contains("hunter2-SECRET") && !text.contains("7777"),
+            "{text}"
+        );
+    }
+
+    let dto: Signup = serde_json::from_slice(&req.body).unwrap();
+    let errors = armature_validation::ValidationErrors::from(dto.validate().unwrap_err());
+    let response = armature_validation::ValidationPipe::error_response(errors);
+    let body = String::from_utf8(response.body.to_vec()).unwrap();
+    assert!(
+        !body.contains("hunter2-SECRET") && !body.contains("7777"),
+        "{body}"
+    );
+}

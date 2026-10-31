@@ -1,0 +1,17 @@
+# cargo-deny policy: advisories, banned/duplicate crates and crate sources.
+# Licenses are not checked here; every dependency is reviewed on adoption.
+
+[advisories]
+# Unmaintained and unsound crates are failures too, not just vulnerabilities.
+unmaintained = "all"
+
+[bans]
+multiple-versions = "allow"
+wildcards = "deny"
+# Native TLS is excluded across the Armature workspace: rustls only.
+deny = [{ crate = "openssl-sys" }, { crate = "native-tls" }]
+
+[sources]
+# Only crates.io; no git or alternative registries.
+unknown-registry = "deny"
+unknown-git = "deny"

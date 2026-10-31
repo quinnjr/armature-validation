@@ -647,14 +647,15 @@ impl<T: Numeric> InRange<T> {
 /// [`CACHE_ENTRIES`]. Each compiled entry is weighed at the smallest of
 /// [`SIZE_CLASSES`] its program compiles within, or at the `regex` crate's
 /// default limit if it needs more. The class limits each NFA separately, so
-/// the weight is approximate: anchored patterns measure below it, unanchored
-/// ones up to about 1.25 × it; an error is weighed at [`ERROR_WEIGHT`]. Unicode classes make large
-/// programs common: `^[\w.-]{3,32}$` is in the 2 MiB class and
+/// the weight is approximate: measured programs range from below it to about
+/// 1.25 × it. An error is weighed at [`ERROR_WEIGHT`]. Unicode classes make
+/// large programs common: `^[\w.-]{3,32}$` is in the 2 MiB class and
 /// `^\w{1,64}$` in the 4 MiB one, so the budget holds 64–128 such patterns;
 /// `^[\w ]{1,100}$` needs more than 4 MiB and is weighed at 10 MiB. Search
 /// caches are not retained: a cached `Regex` is cloned out per call, and a
 /// clone starts with an empty search-cache pool (tens of microseconds to
-/// warm, against milliseconds to compile), which is dropped with it.///
+/// warm, against milliseconds to compile), which is dropped with it.
+///
 /// Eviction is CLOCK (second chance): a lookup marks its entry referenced,
 /// the eviction hand skips and clears referenced entries, and a new entry is
 /// placed behind the hand. A working set that fits stays cached while a
@@ -662,7 +663,8 @@ impl<T: Numeric> InRange<T> {
 /// through the unreferenced slots. A working set cycled in order and larger
 /// than the cache misses on every call, as with any CLOCK or LRU cache.
 ///
-/// The source itself is counted in an entry's weight, and a source longer
+/// The source itself is counted in an entry's weight (three times: the map
+/// key, the eviction ring and the compiled `Regex` each hold a copy), and a source longer
 /// than [`MAX_PATTERN`] is never cached (it is compiled once per call, with
 /// no size-class probing).
 ///
@@ -710,6 +712,10 @@ impl Drop for Leader {
         }
     }
 }
+
+/// A pattern whose compile panics, to test that waiters fail closed.
+#[cfg(test)]
+const PANIC_FOR_TEST: &str = "__armature_validation_panic_for_test__";
 
 #[cfg(test)]
 static COMPILES: LazyLock<Mutex<HashMap<PatternKey, usize>>> = LazyLock::new(Default::default);
@@ -865,7 +871,7 @@ impl Matches {
                 MATCHES_CACHE
                     .write()
                     .unwrap_or_else(|e| e.into_inner())
-                    .insert(key, compiled.clone(), weight + pattern.len());
+                    .insert(key, compiled.clone(), weight + 3 * pattern.len());
                 compiled
             }
         };
@@ -894,6 +900,16 @@ impl Matches {
     /// costs about two to two and a half times a plain compile; only a cold
     /// miss pays it, since results (errors included) are cached.
     fn compile(full: bool, pattern: &str) -> (Compiled, usize) {
+        #[cfg(test)]
+        if pattern == PANIC_FOR_TEST {
+            *COMPILES
+                .lock()
+                .unwrap()
+                .entry((full, pattern.to_owned()))
+                .or_default() += 1;
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            panic!("compile panicked for test");
+        }
         #[cfg(test)]
         {
             *COMPILES
@@ -1538,6 +1554,33 @@ mod tests {
         assert_eq!(Matches::compiles(false, pattern), 1);
         let key = (false, pattern.to_owned());
         assert!(!MATCHES_INFLIGHT.lock().unwrap().contains_key(&key));
+    }
+
+    /// A compile that panics fails its waiters closed with an internal error,
+    /// retires its slot, and is not cached: the next call compiles afresh.
+    #[test]
+    fn matches_cache_survives_a_panicking_compile() {
+        let leader = std::thread::spawn(|| Matches::new(PANIC_FOR_TEST));
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        let waiters: Vec<_> = (0..4)
+            .map(|_| std::thread::spawn(|| Matches::new(PANIC_FOR_TEST).err()))
+            .collect();
+        assert!(leader.join().is_err(), "the leader's panic propagates");
+        for waiter in waiters {
+            // A waiter either shared the leader's slot (internal error) or,
+            // arriving after it was retired, led a compile that panicked too.
+            match waiter.join() {
+                Ok(Some(e)) => assert!(e.to_string().contains("internal error"), "{e}"),
+                Ok(None) => panic!("a panicking compile produced a regex"),
+                Err(_) => {}
+            }
+        }
+        let key = (false, PANIC_FOR_TEST.to_owned());
+        assert!(!MATCHES_INFLIGHT.lock().unwrap().contains_key(&key));
+        assert!(MATCHES_CACHE.read().unwrap().get(&key).is_none());
+        let before = Matches::compiles(false, PANIC_FOR_TEST);
+        assert!(std::panic::catch_unwind(|| Matches::new(PANIC_FOR_TEST)).is_err());
+        assert_eq!(Matches::compiles(false, PANIC_FOR_TEST), before + 1);
     }
 
     /// A pattern that fails to compile is compiled once too: concurrent

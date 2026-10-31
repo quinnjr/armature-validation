@@ -34,14 +34,22 @@ jobs:
           toolchain: stable
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - run: cargo install cargo-audit --locked --version 0.22.2
-      # `Cargo.lock` is not committed (this is a library), so audit the graph
-      # a consumer would resolve today.
-      # Resolve the newest versions, not the MSRV-compatible ones the
-      # rust-version-aware resolver would pick: that is what most consumers
-      # get.
+      - run: cargo install cargo-deny --locked --version 0.20.2
+      # `Cargo.lock` is not committed (this is a library), so audit the graphs
+      # consumers resolve today: first the newest versions, which is what most
+      # get, then (below) the MSRV-compatible ones.
       - run: cargo generate-lockfile
         env:
           CARGO_RESOLVER_INCOMPATIBLE_RUST_VERSIONS: allow
+      - run: cargo audit --deny warnings
+      # Advisories again under cargo-deny's policy (unmaintained crates fail
+      # too), plus banned crates (native TLS) and non-crates.io sources.
+      - run: cargo deny check advisories bans sources
+      # Consumers on an older toolchain resolve older versions; audit the
+      # graph the MSRV-aware resolver picks for 1.94.1 as well.
+      - run: cargo generate-lockfile
+        env:
+          CARGO_RESOLVER_INCOMPATIBLE_RUST_VERSIONS: fallback
       - run: cargo audit --deny warnings
       # The fuzz harness is its own workspace with its own (also uncommitted)
       # lockfile; its dependencies run in CI too.

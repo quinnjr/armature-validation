@@ -9,6 +9,10 @@ Earlier changes are recorded in the workspace [`CHANGELOG.md`](https://github.co
 
 ## [Unreleased]
 
+Breaking: the next release is 0.8.0. Validators reject more input (see the
+entries marked breaking), error output no longer carries submitted values, and
+dependency features this crate used to enable for its consumers are gone.
+
 ### Security
 
 - **Submitted values no longer reach clients or error output (breaking).** Every
@@ -33,11 +37,13 @@ Earlier changes are recorded in the workspace [`CHANGELOG.md`](https://github.co
   category and position, so the value does not reach core's debug log either.
   Code matching on `Error::BadRequest` from `parse` or `validate!` must now
   match `Error::Validation` / `Error::Deserialization`.
-- **`Min`, `Max`, `InRange` and `IsPositive` reject NaN and infinities.**
+- **`Min`, `Max`, `InRange` and `IsPositive` reject NaN and infinities
+  (breaking).**
   `Min(0.0)` and `Max(100.0)` both accepted `f64::NAN` (every comparison with
   NaN is false), and `"NaN".parse::<f64>()` is how a query parameter becomes
   one. A NaN *bound* now rejects every value instead of accepting every value.
-- **`IsUrl` accepts only URLs the parser reads exactly as written.** Beyond the
+- **`IsUrl` accepts only URLs the parser reads exactly as written
+  (breaking).** Beyond the
   control-character check, it accepted strings the WHATWG parser rewrites, so
   the caller kept a different URL from the one examined: `https:\\evil.com`,
   `https:evil.com`, `https://ex%61mple.com`, zero-width and fullwidth
@@ -63,23 +69,23 @@ Earlier changes are recorded in the workspace [`CHANGELOG.md`](https://github.co
   (`validationFailed`) without discarding other fields' errors, and the call
   falls back to the synchronous path outside a Tokio runtime instead of
   panicking.
-- **`NotEmpty` rejects invisible-only values** (zero-width spaces, bidi
-  controls, Hangul fillers, the braille blank, combining marks with nothing to
-  combine with in the common scripts, and similar), which displayed as blank
-  while passing a `trim()` check. Control-only values such as `"\0"` are
-  rejected too.
-- **`IsEmail` enforces RFC 5321 lengths and dot-atom rules**: at most 64
-  octets before the `@` and 254 in total, and no leading, trailing or
+- **`NotEmpty` rejects invisible-only values (breaking)**: zero-width
+  spaces, bidi controls, Hangul fillers, the braille blank, combining marks
+  with nothing to combine with in the common scripts, and similar, which
+  displayed as blank while passing a `trim()` check. Control-only values such
+  as `"\0"` are rejected too.
+- **`IsEmail` enforces RFC 5321 lengths and dot-atom rules (breaking)**: at
+  most 64 octets before the `@` and 254 in total, and no leading, trailing or
   consecutive dots in the local part.
 
 ### Fixed
 
-- `validate!` referred to `armature_core::Error` and called `.validate()`
-  through whatever trait was in scope, so it did not compile for a crate that
-  depended only on `armature-validation`. It now uses `$crate` paths and calls
-  `armature_validation::Validate::validate`, so the DTO must implement this
-  crate's `Validate` (a type with only an inherent `validate` method no
-  longer works with the macro).
+- **Breaking:** `validate!` referred to `armature_core::Error` and called
+  `.validate()` through whatever trait was in scope, so it did not compile
+  for a crate that depended only on `armature-validation`. It now uses
+  `$crate` paths and calls `armature_validation::Validate::validate`, so the
+  DTO must implement this crate's `Validate` (a type with only an inherent
+  `validate` method no longer works with the macro).
 - `validate_parallel` returns errors in rule order, matching `validate`.
 - README: the install line named `0.1`, the license was given as
   `MIT OR Apache-2.0` (the crate is `Apache-2.0`), and it advertised
@@ -126,11 +132,20 @@ Earlier changes are recorded in the workspace [`CHANGELOG.md`](https://github.co
   characters with spaces so a caller-written field or message cannot break
   the line.
 - `ValidationContext`'s `Debug` lists keys only, not the request data.
+- `Display` for `ValidationError` and `ValidationErrors` (what logs print)
+  replaces control, line-separator and bidi characters with spaces, and
+  `ValidationErrors` lists at most 100 errors of at most 200 characters each.
+  `to_json` bounds each `field` and `message` to 200 characters as well.
 - `MaxLength` stops counting once the limit is exceeded.
-- Dependencies: `once_cell` replaced by `std::sync::LazyLock`; `tokio` trimmed
-  to the `rt` feature (`macros` moved to dev-dependencies); `serde`'s `derive`
-  feature moved to dev-dependencies; `regex-syntax` 0.8 is a direct dependency
-  (used by `Matches::full`).
+- **Breaking — dependency features:** `tokio` is trimmed to the `rt` feature
+  (`rt-multi-thread`, `sync` and `time` dropped, `macros` moved to
+  dev-dependencies), `serde`'s `derive` feature moved to dev-dependencies, and
+  `armature-core` is required with `default-features = false` (its
+  `h1-backend` default selects the server implementation, which a dependency
+  must not override). A downstream crate that relied on this crate enabling
+  those features through feature unification must now enable them itself.
+- Dependencies: `once_cell` replaced by `std::sync::LazyLock`; `regex-syntax`
+  0.8 is a direct dependency (used by `Matches::full`).
 - The published package is limited to the library, tests, benches and docs
   (no CI, fuzz or hook configuration).
 

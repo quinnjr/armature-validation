@@ -18,11 +18,13 @@
 //! * `IsEmail` must respect the RFC 5321 length limits and dot rules;
 //! * the numeric validators must never accept a NaN or an infinity, read here
 //!   from the input's leading bytes as both an `f64` and an `f32`;
-//! * `Matches::full` must anchor to the whole value;
+//! * `Matches::full` must anchor to the whole value, for escaped literals and
+//!   arbitrary patterns alike;
+//! * `NotEmpty` must not accept a value with no visible character;
 //! * `ValidationPipe::parse_strict` must not panic on any `Content-Type`
 //!   bytes, must refuse a repeated header, and must accept exactly the JSON
 //!   media types;
-//! * `IsAlpha`, `IsAlphanumeric` and `IsNumeric` must agree with Rust's own
+//! * `IsAlpha`, `IsAlphanumeric` and `IsNumeric` must agree with Rust's ASCII
 //!   character classification, and must not disagree with each other;
 //! * `MinLength` and `MaxLength` must bound `char`s rather than bytes, which
 //!   only text outside ASCII can tell apart.
@@ -210,11 +212,12 @@ fuzz_target!(|data: &[u8]| {
         );
     }
 
-    // Character-class validators must agree with the standard library, and are
-    // documented as requiring a non-empty run of the relevant class.
+    // Character-class validators are documented as ASCII-only and requiring a
+    // non-empty run, so they must agree with the standard library's `ascii`
+    // predicates; the Unicode ones would let a slip to `\p{L}` pass.
     if is_alpha {
         assert!(
-            !value.is_empty() && value.chars().all(|c| c.is_alphabetic()),
+            !value.is_empty() && value.chars().all(|c| c.is_ascii_alphabetic()),
             "IsAlpha accepted {value:?}",
         );
         assert!(
@@ -224,19 +227,17 @@ fuzz_target!(|data: &[u8]| {
     }
     if is_numeric {
         assert!(
-            !value.is_empty() && value.chars().all(|c| c.is_numeric()),
+            !value.is_empty() && value.chars().all(|c| c.is_ascii_digit()),
             "IsNumeric accepted {value:?}",
         );
     }
     if is_alnum {
         assert!(
-            !value.is_empty() && value.chars().all(|c| c.is_alphanumeric()),
+            !value.is_empty() && value.chars().all(|c| c.is_ascii_alphanumeric()),
             "IsAlphanumeric accepted {value:?}",
         );
     }
 
-    // An email must at least be non-empty; the regex is the definition of the
-    // rest, so asserting a second pattern here would only restate it.
     // RFC 5321 limits and the dot-atom shape of the local part.
     if is_email {
         let (local, _) = value
@@ -252,14 +253,50 @@ fuzz_target!(|data: &[u8]| {
         );
     }
 
-    // `NotEmpty` is documented as rejecting input that is empty or whitespace
-    // only. Stated as a property of the characters rather than as a second call
-    // to `trim`, so that a validator narrowed to a plain emptiness check — which
-    // would still agree with `trim` on every ASCII-space-free input — is caught.
+    // `NotEmpty` is documented as rejecting input with no visible character:
+    // whitespace, controls, and the zero-width, bidi, filler and combining
+    // characters that display as nothing. Stated as a property of the
+    // characters, against a short list of the best-known invisible ones, so
+    // a narrowing to `trim().is_empty()` is caught.
     if NotEmpty::validate(value, FIELD).is_ok() {
+        let invisible = |c: char| {
+            c.is_whitespace()
+                || c.is_control()
+                || matches!(
+                    c,
+                    '\u{00AD}'
+                        | '\u{034F}'
+                        | '\u{0300}'..='\u{036F}'
+                        | '\u{115F}'
+                        | '\u{1160}'
+                        | '\u{200B}'..='\u{200F}'
+                        | '\u{202A}'..='\u{202E}'
+                        | '\u{2060}'..='\u{2064}'
+                        | '\u{2800}'
+                        | '\u{3164}'
+                        | '\u{FE00}'..='\u{FE0F}'
+                        | '\u{FEFF}'
+                )
+        };
         assert!(
-            value.chars().any(|c| !c.is_whitespace()),
-            "NotEmpty accepted {value:?}, which holds no non-whitespace character",
+            !value.chars().all(invisible),
+            "NotEmpty accepted {value:?}, which holds no visible character",
+        );
+    }
+
+    // `Matches::full` on an arbitrary pattern: whatever the pattern, a value
+    // it accepts is matched in full, so the pattern cannot have escaped its
+    // anchoring. Input `pattern \u{1} subject`, kept short since each
+    // distinct pattern compiles.
+    if let Some((pattern, subject)) = value.split_once('\u{1}')
+        && pattern.len() <= 64
+        && let Ok(full) = Matches::full(pattern)
+        && full.validate(subject, FIELD).is_ok()
+    {
+        let found = full.0.find(subject);
+        assert!(
+            found.is_some_and(|m| m.start() == 0 && m.end() == subject.len()),
+            "full({pattern:?}) accepted {subject:?} with match {found:?}",
         );
     }
 
