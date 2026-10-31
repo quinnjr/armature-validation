@@ -1560,8 +1560,12 @@ mod tests {
     /// retires its slot, and is not cached: the next call compiles afresh.
     #[test]
     fn matches_cache_survives_a_panicking_compile() {
+        let key = (false, PANIC_FOR_TEST.to_owned());
         let leader = std::thread::spawn(|| Matches::new(PANIC_FOR_TEST));
-        std::thread::sleep(std::time::Duration::from_millis(10));
+        // Start the waiters only once the leader holds the slot.
+        while !MATCHES_INFLIGHT.lock().unwrap().contains_key(&key) {
+            std::thread::yield_now();
+        }
         let waiters: Vec<_> = (0..4)
             .map(|_| std::thread::spawn(|| Matches::new(PANIC_FOR_TEST).err()))
             .collect();
@@ -1575,7 +1579,6 @@ mod tests {
                 Err(_) => {}
             }
         }
-        let key = (false, PANIC_FOR_TEST.to_owned());
         assert!(!MATCHES_INFLIGHT.lock().unwrap().contains_key(&key));
         assert!(MATCHES_CACHE.read().unwrap().get(&key).is_none());
         let before = Matches::compiles(false, PANIC_FOR_TEST);

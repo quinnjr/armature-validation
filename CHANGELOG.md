@@ -117,8 +117,8 @@ dependency features this crate used to enable for its consumers are gone.
   errors, so the derive's `regex` rule, which builds a `Matches` on every
   `validate()` call, no longer recompiles per request. The cache is bounded at
   512 entries and a 256 MiB weight budget: each entry is weighed by the
-  256 KiB / 1 / 2 / 4 MiB class its program fits (10 MiB beyond that) plus its
-  source length, so 64–128 typical Unicode rules such as `[\w.-]{3,32}` fit.
+  256 KiB / 1 / 2 / 4 MiB class its program fits (10 MiB beyond that) plus three times
+  its source length, so 64–128 typical Unicode rules such as `[\w.-]{3,32}` fit.
   Weights are approximate (up to ~1.25x for unanchored patterns), and
   resident memory for a full cache measures about 350 MiB. Eviction is CLOCK;
   sources over 64 KiB are not cached. Concurrent misses on one pattern compile
@@ -135,7 +135,8 @@ dependency features this crate used to enable for its consumers are gone.
 - `Display` for `ValidationError` and `ValidationErrors` (what logs print)
   replaces control, line-separator and bidi characters with spaces, and
   `ValidationErrors` lists at most 100 errors of at most 200 characters each.
-  `to_json` bounds each `field` and `message` to 200 characters as well.
+  `to_json` applies the same replacement and 200-character bound to `field`,
+  `message`, `constraint` and the opt-in `value`.
 - `MaxLength` stops counting once the limit is exceeded.
 - **Breaking — dependency features:** `tokio` is trimmed to the `rt` feature
   (`rt-multi-thread`, `sync` and `time` dropped, `macros` moved to

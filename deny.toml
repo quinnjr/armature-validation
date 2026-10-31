@@ -1,5 +1,7 @@
 # cargo-deny policy: advisories, banned/duplicate crates and crate sources.
 # Licenses are not checked here; every dependency is reviewed on adoption.
+# Run it as CI does: `cargo deny check advisories bans sources` (a bare
+# `cargo deny check` also runs the license check, which has no policy here).
 
 [advisories]
 # Unmaintained and unsound crates are failures too, not just vulnerabilities.

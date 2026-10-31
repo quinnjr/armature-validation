@@ -51,6 +51,7 @@ jobs:
         env:
           CARGO_RESOLVER_INCOMPATIBLE_RUST_VERSIONS: fallback
       - run: cargo audit --deny warnings
+      - run: cargo deny check advisories bans sources
       # The fuzz harness is its own workspace with its own (also uncommitted)
       # lockfile; its dependencies run in CI too.
       - run: cargo generate-lockfile --manifest-path fuzz/Cargo.toml

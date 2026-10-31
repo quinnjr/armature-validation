@@ -98,12 +98,20 @@ impl fmt::Debug for ValidationError {
     }
 }
 
-/// `field: message` on one line: characters that would start a new line or
-/// reorder the text are replaced with spaces, since the field and message may
-/// be caller-written and this is what logs print.
+/// `field: message` on one line and bounded: characters that would start a
+/// new line or reorder the text are replaced with spaces, and each part is
+/// cut at [`CLIENT_MESSAGE_MAX_CHARS`](ValidationErrors::CLIENT_MESSAGE_MAX_CHARS),
+/// since the field and message may be caller-written and this is what logs
+/// print.
 impl fmt::Display for ValidationError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}: {}", one_line(&self.field), one_line(&self.message))
+        let max = ValidationErrors::CLIENT_MESSAGE_MAX_CHARS;
+        write!(
+            f,
+            "{}: {}",
+            bounded(&one_line(&self.field), max),
+            bounded(&one_line(&self.message), max)
+        )
     }
 }
 
@@ -170,14 +178,16 @@ impl ValidationErrors {
         let shown = self.errors.len().min(Self::JSON_MAX_ERRORS);
         let mut json = serde_json::json!({
             "errors": self.errors[..shown].iter().map(|e| {
-                // JSON escapes control characters; only length needs bounding.
+                // JSON escapes only U+0000–U+001F, so line separators and
+                // bidi controls are replaced here, as in `Display`.
+                let max = Self::CLIENT_MESSAGE_MAX_CHARS;
                 let mut entry = serde_json::json!({
-                    "field": bounded(&e.field, Self::CLIENT_MESSAGE_MAX_CHARS),
-                    "message": bounded(&e.message, Self::CLIENT_MESSAGE_MAX_CHARS),
-                    "constraint": e.constraint,
+                    "field": bounded(&one_line(&e.field), max),
+                    "message": bounded(&one_line(&e.message), max),
+                    "constraint": bounded(&one_line(&e.constraint), max),
                 });
                 if with_values && let Some(value) = &e.value {
-                    entry["value"] = serde_json::Value::String(value.clone());
+                    entry["value"] = bounded(&one_line(value), max).into();
                 }
                 entry
             }).collect::<Vec<_>>()
