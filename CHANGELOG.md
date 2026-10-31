@@ -61,7 +61,7 @@ Earlier changes are recorded in the workspace [`CHANGELOG.md`](https://github.co
   panicking.
 - **`NotEmpty` rejects invisible-only values** (zero-width spaces, bidi
   controls, Hangul fillers, the braille blank, combining marks with nothing to
-  combine with, and similar), which displayed as blank while passing a
+  combine with in the common scripts, and similar), which displayed as blank while passing a
   `trim()` check. Control-only values such as `"\0"` are rejected too.
 - **`IsEmail` enforces RFC 5321 lengths and dot-atom rules**: at most 64
   octets before the `@` and 254 in total, and no leading, trailing or
@@ -98,9 +98,10 @@ Earlier changes are recorded in the workspace [`CHANGELOG.md`](https://github.co
 
 ### Changed
 
-- `Matches::new` caches compiled patterns (up to 256 patterns of at most 1 KiB
-  source and 256 KiB compiled, with lazy-DFA caches capped at 256 KiB, evicting
-  one entry per insertion when full), so the derive's `regex`
+- `Matches::new` caches compiled patterns: up to 256 that compile within
+  256 KiB (lazy-DFA caches capped at 256 KiB), plus up to 16 larger ones such
+  as Unicode `[\w.-]{3,32}`; sources over 1 KiB are not cached, and a full
+  tier evicts one entry per insertion, so the derive's `regex`
   rule, which builds a `Matches` on every `validate()` call, no longer
   recompiles the pattern per request.
 - `ValidationErrors::client_message` does not repeat the field name when the

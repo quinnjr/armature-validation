@@ -20,6 +20,9 @@ armature-proc-macro = { version = "0.6" }
 serde = "1.0"
 serde_json = "1.0"
 regex = "1.13"
+# Parses (without compiling) the bare pattern `Matches::full` anchors. The
+# same major `regex` itself uses.
+regex-syntax = "0.8"
 # `IsUrl` parses rather than pattern-matches: a regex that "looks like a URL"
 # both rejects valid URLs (`https://a`) and accepts invalid ones (`https://!!`).
 url = "2.5"

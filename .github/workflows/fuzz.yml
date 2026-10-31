@@ -40,9 +40,10 @@ jobs:
         with:
           workspaces: fuzz
       # Keep the corpus between runs: 60 seconds from an empty corpus every
-      # time never gets past the shallow inputs. Saved under a per-run key and
-      # restored from the newest, so it accumulates.
-      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      # time never gets past the shallow inputs. Restored from the newest
+      # entry; saved (minimised) only from pushes to the long-lived branches,
+      # so PR runs do not each add an entry to the repository's cache quota.
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: fuzz/corpus/${{ matrix.target }}
           key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
@@ -56,6 +57,14 @@ jobs:
       - run: cargo clippy --manifest-path fuzz/Cargo.toml --all-targets -- -D warnings
       - name: Fuzz ${{ matrix.target }} for 60s
         run: cargo fuzz run ${{ matrix.target }} -- -max_total_time=60 -print_final_stats=1
+      - name: Minimise corpus
+        if: github.event_name == 'push'
+        run: cargo fuzz cmin ${{ matrix.target }}
+      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        if: github.event_name == 'push'
+        with:
+          path: fuzz/corpus/${{ matrix.target }}
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
       # The crash file is the reproducer. Without it the log line naming the
       # input is all that survives the runner, and re-finding it costs a run.
       - name: Upload crash artifacts

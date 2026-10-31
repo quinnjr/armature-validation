@@ -99,15 +99,28 @@ fn is_invisible(c: char) -> bool {
     )
 }
 
-/// Combining marks: they attach to a preceding character, and a value made
-/// of nothing else renders as blank or as a stray accent.
+/// Combining marks from the common blocks (generic diacritics, Cyrillic,
+/// Hebrew, Arabic, Devanagari, Thai, kana voicing): they attach to a
+/// preceding character, and a value made of nothing else renders as blank or
+/// as a stray accent. A best-effort list, not the full `Mn`/`Me` categories.
 fn is_combining_mark(c: char) -> bool {
     matches!(
         c,
         '\u{0300}'..='\u{036F}'
+            | '\u{0483}'..='\u{0489}'
+            | '\u{0591}'..='\u{05BD}'
+            | '\u{05BF}'..='\u{05C7}'
+            | '\u{0610}'..='\u{061A}'
+            | '\u{064B}'..='\u{065F}'
+            | '\u{0900}'..='\u{0903}'
+            | '\u{093A}'..='\u{094F}'
+            | '\u{0E31}'
+            | '\u{0E34}'..='\u{0E3A}'
+            | '\u{0E47}'..='\u{0E4E}'
             | '\u{1AB0}'..='\u{1AFF}'
             | '\u{1DC0}'..='\u{1DFF}'
             | '\u{20D0}'..='\u{20FF}'
+            | '\u{3099}'..='\u{309A}'
             | '\u{FE20}'..='\u{FE2F}'
             | '\u{1D165}'..='\u{1D169}'
             | '\u{1D16D}'..='\u{1D172}'
@@ -611,31 +624,58 @@ impl<T: Numeric> InRange<T> {
     }
 }
 
-/// Compiled patterns, keyed by source, so that a pattern built per call (as
-/// `#[derive(Validate)]`'s `regex` rule does on every `validate()`) is compiled
-/// once rather than on every request.
+/// Compiled patterns, keyed by `(anchored, source)`, so that a pattern built
+/// per call (as `#[derive(Validate)]`'s `regex` rule does on every
+/// `validate()`) is compiled once rather than on every request.
 ///
-/// Bounded in entries and in key size. When full, one arbitrary entry (the
-/// first in hash order, so effectively random) is evicted per insertion: a
-/// burst of one-off patterns (e.g. ones built from request data) cannot pin
-/// the cache, and a working set slightly over capacity still mostly hits,
-/// where clearing or freezing would miss on every call.
+/// Two tiers, each bounded in entries, so the total is bounded too:
 ///
-/// Entries are also bounded in *compiled* size: a short pattern such as
-/// `\w{90}` compiles to megabytes, so only patterns that compile within
-/// [`MATCHES_CACHE_MAX_COMPILED`] are retained, and their lazy-DFA caches
-/// (one per thread using the regex) are capped at
-/// [`MATCHES_CACHE_MAX_DFA`]. That bounds the cache at roughly
-/// 256 × (256 KiB + threads × 256 KiB).
+/// - patterns compiling within [`SMALL_COMPILED`] (and lazy-DFA caches
+///   within [`SMALL_DFA`] per thread) go in a tier of [`SMALL_ENTRIES`];
+/// - larger ones, under the `regex` crate's default limits, go in a tier of
+///   [`LARGE_ENTRIES`]. Unicode classes make this common: `^[\w.-]{3,32}$`
+///   compiles to about 2 MiB, and recompiling it per request costs
+///   milliseconds.
 ///
-/// Keyed by `(anchored, pattern)`: see [`Matches::full`].
-static MATCHES_CACHE: LazyLock<RwLock<HashMap<(bool, String), Regex>>> =
-    LazyLock::new(|| RwLock::new(HashMap::new()));
+/// A source longer than [`MAX_PATTERN`] is never cached. When a tier is full,
+/// one entry is evicted per insertion, rotating through positions, so a burst
+/// of one-off patterns (e.g. ones built from request data) cannot pin it.
+static MATCHES_CACHE: LazyLock<RwLock<PatternCache>> = LazyLock::new(Default::default);
 static MATCHES_CACHE_EVICTIONS: AtomicUsize = AtomicUsize::new(0);
-const MATCHES_CACHE_CAPACITY: usize = 256;
-const MATCHES_CACHE_MAX_PATTERN: usize = 1024;
-const MATCHES_CACHE_MAX_COMPILED: usize = 256 * 1024;
-const MATCHES_CACHE_MAX_DFA: usize = 256 * 1024;
+const MAX_PATTERN: usize = 1024;
+const SMALL_ENTRIES: usize = 256;
+const SMALL_COMPILED: usize = 256 * 1024;
+const SMALL_DFA: usize = 256 * 1024;
+const LARGE_ENTRIES: usize = 16;
+
+type PatternKey = (bool, String);
+
+#[derive(Default)]
+struct PatternCache {
+    small: HashMap<PatternKey, Regex>,
+    large: HashMap<PatternKey, Regex>,
+}
+
+impl PatternCache {
+    fn get(&self, key: &PatternKey) -> Option<&Regex> {
+        self.small.get(key).or_else(|| self.large.get(key))
+    }
+
+    fn insert(&mut self, key: PatternKey, regex: Regex, large: bool) {
+        let (tier, capacity) = if large {
+            (&mut self.large, LARGE_ENTRIES)
+        } else {
+            (&mut self.small, SMALL_ENTRIES)
+        };
+        if !tier.contains_key(&key) && tier.len() >= capacity {
+            let n = MATCHES_CACHE_EVICTIONS.fetch_add(1, AtomicOrdering::Relaxed) % tier.len();
+            if let Some(victim) = tier.keys().nth(n).cloned() {
+                tier.remove(&victim);
+            }
+        }
+        tier.insert(key, regex);
+    }
+}
 
 /// Custom regex validator.
 ///
@@ -659,9 +699,13 @@ impl Matches {
 
     /// Like [`Matches::new`], but the pattern must match the whole value.
     ///
-    /// The pattern is compiled on its own first, so one with an unbalanced
-    /// `)` is an error rather than a way to close the anchoring group early
+    /// The pattern is parsed on its own first, so one with an unbalanced `)`
+    /// is an error rather than a way to close the anchoring group early
     /// (`a)|(?:b` would otherwise become `^(?:a)|(?:b)$`).
+    ///
+    /// The pattern is wrapped as `\A(?:pattern)\z`, so a verbose-mode
+    /// (`(?x)`) pattern ending in a `#` comment is rejected: the comment
+    /// would swallow the closing `)`. End such a pattern with a newline.
     pub fn full(pattern: &str) -> Result<Self, regex::Error> {
         Self::cached_compile(true, pattern)
     }
@@ -680,38 +724,31 @@ impl Matches {
             return Ok(Self(regex.clone()));
         }
         let source = if full {
-            Regex::new(pattern)?;
+            // Parsing is enough to reject an unbalanced pattern, and far
+            // cheaper than compiling it.
+            regex_syntax::Parser::new()
+                .parse(pattern)
+                .map_err(|e| regex::Error::Syntax(e.to_string()))?;
             format!(r"\A(?:{pattern})\z")
         } else {
             pattern.to_owned()
         };
-        // Try a compile small enough to cache; a pattern that does not fit is
-        // compiled again under the default limits and returned uncached.
-        let small = (pattern.len() <= MATCHES_CACHE_MAX_PATTERN)
-            .then(|| {
-                regex::RegexBuilder::new(&source)
-                    .size_limit(MATCHES_CACHE_MAX_COMPILED)
-                    .dfa_size_limit(MATCHES_CACHE_MAX_DFA)
-                    .build()
-            })
-            .and_then(|r| match r {
-                Err(regex::Error::CompiledTooBig(_)) => None,
-                other => Some(other),
-            })
-            .transpose()?;
-        let Some(regex) = small else {
+        if pattern.len() > MAX_PATTERN {
             return Ok(Self(Regex::new(&source)?));
-        };
-        let mut cache = MATCHES_CACHE.write().unwrap_or_else(|e| e.into_inner());
-        if !cache.contains_key(&key) && cache.len() >= MATCHES_CACHE_CAPACITY {
-            // Rotate through positions rather than always taking the first
-            // key, which would evict the same hot entry on every insert.
-            let n = MATCHES_CACHE_EVICTIONS.fetch_add(1, AtomicOrdering::Relaxed) % cache.len();
-            if let Some(victim) = cache.keys().nth(n).cloned() {
-                cache.remove(&victim);
-            }
         }
-        cache.insert(key, regex.clone());
+        let small = regex::RegexBuilder::new(&source)
+            .size_limit(SMALL_COMPILED)
+            .dfa_size_limit(SMALL_DFA)
+            .build();
+        let (regex, large) = match small {
+            Ok(regex) => (regex, false),
+            Err(regex::Error::CompiledTooBig(_)) => (Regex::new(&source)?, true),
+            Err(e) => return Err(e),
+        };
+        MATCHES_CACHE
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key, regex.clone(), large);
         Ok(Self(regex))
     }
 
@@ -720,7 +757,8 @@ impl Matches {
         MATCHES_CACHE
             .read()
             .unwrap_or_else(|e| e.into_inner())
-            .contains_key(&(full, pattern.to_owned()))
+            .get(&(full, pattern.to_owned()))
+            .is_some()
     }
 
     pub fn validate(&self, value: &str, field: &str) -> Result<(), ValidationError> {
@@ -1083,6 +1121,11 @@ mod tests {
             "\u{1D159}",
             "\u{1F3FB}",
             "\u{FFFC}",
+            "\u{05B0}",
+            "\u{0483}",
+            "\u{093C}",
+            "\u{0E31}",
+            "\u{3099}",
             "\u{202E}",
             "\0",
             " \u{200B}\t",
@@ -1239,25 +1282,50 @@ mod tests {
         assert!(alt.validate("b", "f").is_ok());
     }
 
+    /// On a private cache, so other tests' entries in the global one are not
+    /// evicted mid-assertion.
     #[test]
     fn matches_cache_stays_bounded() {
-        for i in 0..(MATCHES_CACHE_CAPACITY + 50) {
-            Matches::new(&format!("^bounded-{i}$")).unwrap();
+        let regex = Regex::new("x").unwrap();
+        let mut cache = PatternCache::default();
+        for i in 0..(SMALL_ENTRIES + 50) {
+            cache.insert((false, format!("s{i}")), regex.clone(), false);
         }
-        let len = MATCHES_CACHE.read().unwrap().len();
-        assert!(len <= MATCHES_CACHE_CAPACITY, "cache grew to {len}");
-        // A short pattern with a large compiled form is not retained.
-        let big = r"\w{200}";
+        for i in 0..(LARGE_ENTRIES + 5) {
+            cache.insert((false, format!("l{i}")), regex.clone(), true);
+        }
+        assert_eq!(cache.small.len(), SMALL_ENTRIES);
+        assert_eq!(cache.large.len(), LARGE_ENTRIES);
+        // Re-inserting a present key does not evict anything.
+        let present = cache.small.keys().next().cloned().unwrap();
+        let before: Vec<_> = cache.small.keys().cloned().collect();
+        cache.insert(present, regex, false);
+        assert_eq!(cache.small.len(), SMALL_ENTRIES);
+        assert!(before.iter().all(|k| cache.small.contains_key(k)));
+    }
+
+    /// Unicode classes with a bounded repeat compile to megabytes; they are
+    /// the common shape of a derive `regex` rule and must still be cached.
+    #[test]
+    fn matches_caches_large_unicode_patterns() {
+        let pattern = r"^[\w.-]{3,32}$";
         assert!(
-            Matches::new(big)
+            Matches::new(pattern)
                 .unwrap()
-                .validate(&"a".repeat(200), "f")
+                .validate("user.name", "f")
                 .is_ok()
         );
-        assert!(
-            !Matches::cached(false, big),
-            "large compiled pattern was cached"
-        );
+        assert!(Matches::cached(false, pattern));
+        assert!(Matches::full(r"[\w.-]{3,32}").is_ok());
+        assert!(Matches::cached(true, r"[\w.-]{3,32}"));
+    }
+
+    #[test]
+    fn matches_full_supports_verbose_mode_ending_in_newline() {
+        assert!(Matches::full("(?x) [a-z]+ # letters").is_err());
+        let m = Matches::full("(?x) [a-z]+ # letters\n").unwrap();
+        assert!(m.validate("abc", "f").is_ok());
+        assert!(m.validate("abc1", "f").is_err());
     }
 
     #[test]
@@ -1266,7 +1334,7 @@ mod tests {
         let a = Matches::new(pattern).unwrap();
         assert!(Matches::cached(false, pattern));
         assert!(a.validate("cache-me-42", "f").is_ok());
-        let long = format!("^{}$", "x".repeat(MATCHES_CACHE_MAX_PATTERN));
+        let long = format!("^{}$", "x".repeat(MAX_PATTERN));
         assert!(Matches::new(&long).is_ok());
         assert!(
             !Matches::cached(false, &long),
