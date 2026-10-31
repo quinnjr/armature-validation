@@ -23,6 +23,9 @@ armature-validation = { path = ".." }
 # elsewhere instead of floating on `1`.
 uuid = "1.23"
 url = "2.5"
+# Escapes fuzz input into a literal pattern for `Matches::full`; the version
+# `armature-validation` itself requires.
+regex = "1.13"
 
 [[bin]]
 name = "validators"

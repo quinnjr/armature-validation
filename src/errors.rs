@@ -30,7 +30,11 @@ pub struct ValidationError {
 }
 
 impl ValidationError {
-    /// Create a new validation error
+    /// Create a new validation error.
+    ///
+    /// `field` and `message` are sent to clients as written, so do not build
+    /// either from the submitted value (`format!("{v} is invalid")` reflects
+    /// it back); use [`with_value`](Self::with_value), which is redacted.
     pub fn new(field: impl Into<String>, message: impl Into<String>) -> Self {
         let field = field.into();
         Self {
@@ -142,15 +146,38 @@ impl ValidationErrors {
     }
 
     /// A one-line summary that is safe to send to a client: each error's
-    /// `field: message`, joined with `"; "`. Never includes the submitted
-    /// [`value`](ValidationError::value).
+    /// message, prefixed with `field: ` unless the message already names the
+    /// field (as the built-in validators' do), joined with `"; "`. Never
+    /// includes the submitted [`value`](ValidationError::value).
+    ///
+    /// At most [`CLIENT_MESSAGE_MAX_ERRORS`](Self::CLIENT_MESSAGE_MAX_ERRORS)
+    /// errors are listed, followed by a count of the rest, so a body that
+    /// fails thousands of nested checks does not produce a message of the
+    /// same size.
     pub fn client_message(&self) -> String {
-        self.errors
+        let shown = self.errors.len().min(Self::CLIENT_MESSAGE_MAX_ERRORS);
+        let mut message = self.errors[..shown]
             .iter()
-            .map(ToString::to_string)
+            .map(|e| {
+                if e.message.starts_with(&e.field) {
+                    e.message.clone()
+                } else {
+                    e.to_string()
+                }
+            })
             .collect::<Vec<_>>()
             .join("; ")
+            // One line: a control character in a caller-written field or
+            // message must not start a new log line or header.
+            .replace(char::is_control, " ");
+        if self.errors.len() > shown {
+            message.push_str(&format!(" (and {} more)", self.errors.len() - shown));
+        }
+        message
     }
+
+    /// The most errors [`client_message`](Self::client_message) lists.
+    pub const CLIENT_MESSAGE_MAX_ERRORS: usize = 20;
 }
 
 impl fmt::Display for ValidationErrors {
@@ -167,5 +194,61 @@ impl std::error::Error for ValidationErrors {}
 impl From<Vec<ValidationError>> for ValidationErrors {
     fn from(errors: Vec<ValidationError>) -> Self {
         Self::new(errors)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn errors() -> ValidationErrors {
+        ValidationErrors::new(vec![
+            ValidationError::new("password", "password is too short").with_value("hunter2"),
+            ValidationError::new("age", "must be positive"),
+        ])
+    }
+
+    #[test]
+    fn debug_redacts_value() {
+        let debug = format!("{:?}", errors());
+        assert!(!debug.contains("hunter2"), "{debug}");
+        assert!(debug.contains("<redacted>"), "{debug}");
+    }
+
+    #[test]
+    fn to_json_omits_values_unless_asked() {
+        let json = errors().to_json().to_string();
+        assert!(
+            !json.contains("hunter2") && !json.contains("\"value\""),
+            "{json}"
+        );
+        let with = errors().to_json_with_values();
+        assert_eq!(with["errors"][0]["value"], "hunter2");
+        assert!(with["errors"][1].get("value").is_none());
+    }
+
+    #[test]
+    fn client_message_is_one_line() {
+        let errors = ValidationErrors::new(vec![ValidationError::new("a\r\nb", "x\ny")]);
+        assert_eq!(errors.client_message(), "a  b: x y");
+    }
+
+    #[test]
+    fn client_message_is_capped() {
+        let many = ValidationErrors::new(
+            (0..100)
+                .map(|i| ValidationError::new(format!("f{i}"), "bad"))
+                .collect(),
+        );
+        let message = many.client_message();
+        assert!(message.ends_with("f19: bad (and 80 more)"), "{message}");
+    }
+
+    #[test]
+    fn client_message_names_each_field_once() {
+        assert_eq!(
+            errors().client_message(),
+            "password is too short; age: must be positive"
+        );
     }
 }

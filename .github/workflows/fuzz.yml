@@ -8,6 +8,11 @@ on:
 permissions:
   contents: read
 
+# A new push to the same PR supersedes the run in progress.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -15,6 +20,7 @@ jobs:
   fuzz:
     name: fuzz ${{ matrix.target }}
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -35,6 +41,14 @@ jobs:
           workspaces: fuzz
       # Pinned like the actions above: an unpinned install runs whatever was
       # published most recently, with this job's checkout in reach.
+      # Keep the corpus between runs: 60 seconds from an empty corpus every
+      # time never gets past the shallow inputs. Saved under a per-run key and
+      # restored from the newest, so it accumulates.
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: fuzz/corpus/${{ matrix.target }}
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
+          restore-keys: fuzz-corpus-${{ matrix.target }}-
       - run: cargo install cargo-fuzz --locked --version 0.13.2
       # `fuzz/` is its own workspace, so the crate's own clippy run never sees
       # it. Without this the harnesses are the one part of the tree outside the

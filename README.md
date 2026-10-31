@@ -93,13 +93,21 @@ assert!(User { username: "a b".into() }.validate().is_err());
 
 ## Error Output
 
-Validation errors are sent to clients, so the submitted value is never part of
-them: the built-in validators do not record it, `ValidationErrors::to_json`
-leaves it out, and `Debug` output redacts it. `ValidationPipe::parse` and the
+Validation errors are sent to clients, so the submitted value is kept out of
+everything client-facing: the built-in validators do not record it (the
+derive's `range` rule does, and a custom validator may), and whatever is
+recorded is left out of `ValidationErrors::to_json` and `client_message` and
+redacted from `Debug` output. `ValidationPipe::parse` and the
 `validate!` macro return `armature_core::Error::Validation` with `field: message`
 pairs, and a body that fails to deserialize returns
 `armature_core::Error::Deserialization`, whose detail the framework does not
 send to the client.
+
+`ValidationPipe::parse` reads any body as JSON. For an endpoint authenticated
+by cookie, use `ValidationPipe::parse_strict`, which also requires a JSON
+`Content-Type`: a cross-site HTML form can post a JSON-shaped `text/plain`
+body without a CORS preflight. To refuse unknown fields, add
+`#[serde(deny_unknown_fields)]` to the DTO.
 
 ## License
 

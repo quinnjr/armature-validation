@@ -162,10 +162,13 @@ impl ValidationBuilder {
     ///
     /// # Panics in validators
     ///
-    /// A validator that panics fails validation closed: the field gets a
-    /// generic `validationFailed` error. The panic payload is not copied into
-    /// the error, since it may name internals or carry data, and errors are
-    /// sent to clients.
+    /// Inside a runtime, a validator that panics fails validation closed: the
+    /// field gets a generic `validationFailed` error. The panic payload is not
+    /// copied into the error, since it may name internals or carry data, and
+    /// errors are sent to clients. The process's panic hook still runs, so the
+    /// default hook prints the payload to stderr. Outside a runtime the
+    /// synchronous fallback, like [`ValidationBuilder::validate`], lets the
+    /// panic propagate.
     ///
     /// # Examples
     ///

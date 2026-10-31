@@ -15,8 +15,9 @@ impl ValidationPipe {
     ///
     /// - a body that does not deserialize maps to [`Error::Deserialization`],
     ///   which `armature-core` replaces with a generic message for the client.
-    ///   serde's own text quotes the offending input and names fields and enum
-    ///   variants of the target type, so it must not be passed through;
+    ///   The error carries only serde's error category and position, not its
+    ///   message: that quotes the offending input and names fields and enum
+    ///   variants of the target type, and core logs the detail;
     /// - a body that fails validation maps to [`Error::Validation`] with
     ///   [`ValidationErrors::client_message`], i.e. `field: message` pairs only.
     pub fn parse<T>(req: &HttpRequest) -> Result<T, Error>
@@ -24,11 +25,49 @@ impl ValidationPipe {
         T: DeserializeOwned + Validate,
     {
         let parsed: T =
-            serde_json::from_slice(&req.body).map_err(|e| Error::Deserialization(e.to_string()))?;
+            // Only the error's category and position: serde's message quotes the
+            // offending input, and `armature-core` logs `Deserialization` detail.
+            serde_json::from_slice(&req.body).map_err(|e| {
+                Error::Deserialization(format!(
+                    "{:?} error at line {} column {}",
+                    e.classify(),
+                    e.line(),
+                    e.column()
+                ))
+            })?;
 
         parsed.validate().map_err(validation_error)?;
 
         Ok(parsed)
+    }
+
+    /// Like [`parse`](Self::parse), but first requires a JSON `Content-Type`
+    /// (`application/json` or any `application/*+json`), failing with
+    /// [`Error::UnsupportedMediaType`] (415) otherwise.
+    ///
+    /// `parse` reads any body as JSON. A cross-site HTML form can send a JSON
+    /// body as `text/plain` without a CORS preflight, so an endpoint that
+    /// authenticates by cookie and uses `parse` accepts forged requests. Use
+    /// this method for such endpoints.
+    pub fn parse_strict<T>(req: &HttpRequest) -> Result<T, Error>
+    where
+        T: DeserializeOwned + Validate,
+    {
+        let is_json = req.headers.get("content-type").is_some_and(|ct| {
+            let media = ct.split(';').next().unwrap_or("").trim();
+            media.eq_ignore_ascii_case("application/json")
+                || media
+                    .get(..12)
+                    .is_some_and(|p| p.eq_ignore_ascii_case("application/"))
+                    && media.len() > 17
+                    && media[media.len() - 5..].eq_ignore_ascii_case("+json")
+        });
+        if !is_json {
+            return Err(Error::UnsupportedMediaType(
+                "expected a JSON Content-Type".to_string(),
+            ));
+        }
+        Self::parse(req)
     }
 
     /// Transform validation errors to an HTTP 400 response.
@@ -175,6 +214,35 @@ mod tests {
         let client = err.client_message();
         assert!(!client.contains("SECRET-123"), "{client}");
         assert!(!client.contains("age"), "{client}");
+        // Nor in the detail core logs.
+        let logged = err.to_string();
+        assert!(!logged.contains("SECRET-123"), "{logged}");
+    }
+
+    #[test]
+    fn parse_strict_requires_json_content_type() {
+        let body = r#"{"name":"x","age":1}"#;
+        for (ct, ok) in [
+            (None, false),
+            (Some("text/plain"), false),
+            (Some("application/x-www-form-urlencoded"), false),
+            (Some("multipart/form-data; boundary=x"), false),
+            (Some("application/json"), true),
+            (Some("Application/JSON; charset=utf-8"), true),
+            (Some("application/problem+json"), true),
+            (Some("application/+json"), false),
+            (Some("text/+json"), false),
+        ] {
+            let mut req = request(body);
+            if let Some(ct) = ct {
+                req.headers.insert("content-type", ct);
+            }
+            let result = ValidationPipe::parse_strict::<TestDto>(&req);
+            assert_eq!(result.is_ok(), ok, "{ct:?}");
+            if !ok {
+                assert!(matches!(result, Err(Error::UnsupportedMediaType(_))));
+            }
+        }
     }
 
     #[test]

@@ -8,9 +8,10 @@
 
 use crate::ValidationError;
 use regex::Regex;
+use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::fmt;
-use std::sync::{LazyLock, Mutex};
+use std::sync::{LazyLock, RwLock};
 
 /// RFC 5322 `dot-atom` local part, `@`, then a hostname.
 ///
@@ -85,13 +86,33 @@ fn is_invisible(c: char) -> bool {
             | '\u{FE00}'..='\u{FE0F}'
             | '\u{FEFF}'
             | '\u{FFA0}'
-            | '\u{FFF0}'..='\u{FFFB}'
+            | '\u{FFF0}'..='\u{FFFC}'
             | '\u{110BD}'
             | '\u{110CD}'
             | '\u{13430}'..='\u{1343F}'
             | '\u{1BCA0}'..='\u{1BCA3}'
             | '\u{1D173}'..='\u{1D17A}'
+            | '\u{16FE4}'
+            | '\u{1D159}'
             | '\u{E0000}'..='\u{E0FFF}'
+    )
+}
+
+/// Combining marks: they attach to a preceding character, and a value made
+/// of nothing else renders as blank or as a stray accent.
+fn is_combining_mark(c: char) -> bool {
+    matches!(
+        c,
+        '\u{0300}'..='\u{036F}'
+            | '\u{1AB0}'..='\u{1AFF}'
+            | '\u{1DC0}'..='\u{1DFF}'
+            | '\u{20D0}'..='\u{20FF}'
+            | '\u{FE20}'..='\u{FE2F}'
+            | '\u{1D165}'..='\u{1D169}'
+            | '\u{1D16D}'..='\u{1D172}'
+            | '\u{1D17B}'..='\u{1D182}'
+            // Emoji skin-tone modifiers, which modify a preceding emoji.
+            | '\u{1F3FB}'..='\u{1F3FF}'
     )
 }
 
@@ -99,17 +120,18 @@ fn is_invisible(c: char) -> bool {
 
 /// Validates that a string has visible content.
 ///
-/// Rejects a value made only of whitespace, control characters and invisible
-/// characters (zero-width spaces, bidi controls, Hangul fillers and similar),
-/// all of which would otherwise pass for a non-empty name while displaying as
-/// blank.
+/// Rejects a value made only of whitespace, control characters, invisible
+/// characters (zero-width spaces, bidi controls, Hangul fillers and similar)
+/// and combining marks, all of which would otherwise pass for a non-empty name
+/// while displaying as blank. The invisible set is a best-effort denylist of
+/// the common cases, not every code point a font may draw as nothing.
 pub struct NotEmpty;
 
 impl NotEmpty {
     pub fn validate(value: &str, field: &str) -> Result<(), ValidationError> {
         if value
             .chars()
-            .all(|c| c.is_whitespace() || c.is_control() || is_invisible(c))
+            .all(|c| c.is_whitespace() || c.is_control() || is_invisible(c) || is_combining_mark(c))
         {
             Err(
                 ValidationError::new(field, format!("{} should not be empty", field))
@@ -230,7 +252,16 @@ impl IsUrl {
     /// `"https://a.example/\r\nX-Injected: 1"` becomes response splitting.
     ///
     /// Single-label hosts are accepted: `https://a`, `http://localhost` and
-    /// `http://intranet` are all real, resolvable URLs.
+    /// `http://intranet` are all real, resolvable URLs. So are `xn--` hosts,
+    /// which may decode to lookalikes of other domains (`xn--pple-43d.com` is
+    /// `аpple.com` with a Cyrillic `а`); this validator does not judge which
+    /// domains are trustworthy.
+    ///
+    /// It also rejects port 0 and a path beginning with `//`, which is a
+    /// protocol-relative reference to another host when the path is used on
+    /// its own. It does not normalise: `HTTPS://EXAMPLE.COM/` and the
+    /// trailing-dot `https://example.com./` pass as written, so compare hosts
+    /// case-insensitively and without a trailing dot when allowlisting.
     ///
     /// This is a syntax check, **not** an SSRF filter: loopback, private and
     /// link-local addresses (`http://127.0.0.1/`, `http://169.254.169.254/`)
@@ -260,8 +291,30 @@ impl IsUrl {
         })
     }
 
+    /// Every `%` starts a two-hex-digit escape (RFC 3986 §2.1). The parser
+    /// leaves a malformed one alone, but decoders downstream disagree on it.
+    fn has_well_formed_escapes(value: &str) -> bool {
+        let bytes = value.as_bytes();
+        bytes.iter().enumerate().all(|(i, &b)| {
+            b != b'%'
+                || bytes
+                    .get(i + 1..i + 3)
+                    .is_some_and(|hex| hex.iter().all(u8::is_ascii_hexdigit))
+        })
+    }
+
+    /// DNS limits (RFC 1035 §2.3.4): labels of at most 63 octets, a name of
+    /// at most 253 not counting a trailing dot. IP-literals are exempt.
+    fn host_within_dns_limits(host: &str) -> bool {
+        if host.starts_with('[') {
+            return true;
+        }
+        let name = host.strip_suffix('.').unwrap_or(host);
+        name.len() <= 253 && name.split('.').all(|label| label.len() <= 63)
+    }
+
     fn is_valid(value: &str) -> bool {
-        if !value.chars().all(Self::is_uri_char) {
+        if !value.chars().all(Self::is_uri_char) || !Self::has_well_formed_escapes(value) {
             return false;
         }
         let Some(rest) = Self::strip_scheme(value) else {
@@ -282,7 +335,7 @@ impl IsUrl {
         let Some(host) = parsed.host_str() else {
             return false;
         };
-        if !HOST_REGEX.is_match(host) {
+        if !HOST_REGEX.is_match(host) || !Self::host_within_dns_limits(host) {
             return false;
         }
 
@@ -302,10 +355,13 @@ impl IsUrl {
             return false;
         }
         if let Some(port) = raw_port.strip_prefix(':') {
-            // `url` drops an explicit default port and accepts an empty one.
-            let written = (!port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()))
-                .then(|| port.parse::<u16>().ok())
-                .flatten();
+            // `url` drops an explicit default port, accepts an empty one and
+            // strips leading zeros, so the port must be written canonically
+            // (`443`, not `0443`) and be the one the parser kept.
+            let written = port
+                .parse::<u16>()
+                .ok()
+                .filter(|&n| n != 0 && n.to_string() == port);
             if written.is_none() || written != parsed.port_or_known_default() {
                 return false;
             }
@@ -313,12 +369,19 @@ impl IsUrl {
             return false;
         }
 
-        // An empty path is the one thing the parser legitimately adds.
+        // `https://a//evil.example`: a path that starts with `//` is a
+        // protocol-relative URL to a different host once it is used on its
+        // own, as in a redirect to "the path of the validated URL".
+        if tail.starts_with("//") {
+            return false;
+        }
+
+        // An empty path is the one thing the parser legitimately adds: a `/`
+        // on its own, or before a query or fragment that follows the host.
         let parsed_tail = &parsed[url::Position::BeforePath..];
-        if tail.is_empty() {
-            parsed_tail == "/"
-        } else {
-            tail == parsed_tail
+        match parsed_tail.strip_prefix('/') {
+            Some(rest) if !tail.starts_with('/') => tail == rest,
+            _ => tail == parsed_tail,
         }
     }
 }
@@ -451,14 +514,18 @@ fn non_finite(field: &str, constraint: &str) -> ValidationError {
 ///
 /// A float NaN or infinity is rejected: NaN compares false against every
 /// bound, so a plain `value < min` check would let it through, and `"NaN"`
-/// is what `str::parse::<f64>` makes of a query parameter.
+/// is what `str::parse::<f64>` makes of a query parameter. A NaN *bound*
+/// rejects every value, rather than accepting every value.
 pub struct Min<T>(pub T);
 
 impl<T: Numeric> Min<T> {
     pub fn validate(&self, value: T, field: &str) -> Result<(), ValidationError> {
         if !value.is_finite_number() {
             Err(non_finite(field, "min"))
-        } else if value < self.0 {
+        } else if !matches!(
+            value.partial_cmp(&self.0),
+            Some(Ordering::Greater | Ordering::Equal)
+        ) {
             Err(
                 ValidationError::new(field, format!("{} must be at least {}", field, self.0))
                     .with_constraint("min"),
@@ -469,14 +536,18 @@ impl<T: Numeric> Min<T> {
     }
 }
 
-/// Validates maximum value. A float NaN or infinity is rejected, as for [`Min`].
+/// Validates maximum value. A float NaN or infinity is rejected, and a NaN
+/// bound rejects every value, as for [`Min`].
 pub struct Max<T>(pub T);
 
 impl<T: Numeric> Max<T> {
     pub fn validate(&self, value: T, field: &str) -> Result<(), ValidationError> {
         if !value.is_finite_number() {
             Err(non_finite(field, "max"))
-        } else if value > self.0 {
+        } else if !matches!(
+            value.partial_cmp(&self.0),
+            Some(Ordering::Less | Ordering::Equal)
+        ) {
             Err(
                 ValidationError::new(field, format!("{} must be at most {}", field, self.0))
                     .with_constraint("max"),
@@ -538,11 +609,23 @@ impl<T: Numeric> InRange<T> {
 
 /// Compiled patterns, keyed by source, so that a pattern built per call (as
 /// `#[derive(Validate)]`'s `regex` rule does on every `validate()`) is compiled
-/// once rather than on every request. Bounded: once full, further patterns
-/// are compiled but not retained.
-static MATCHES_CACHE: LazyLock<Mutex<HashMap<String, Regex>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
+/// once rather than on every request.
+///
+/// Bounded in entries and in key size. When full, one arbitrary entry (the
+/// first in hash order, so effectively random) is evicted per insertion: a
+/// burst of one-off patterns (e.g. ones built from request data) cannot pin
+/// the cache, and a working set slightly over capacity still mostly hits,
+/// where clearing or freezing would miss on every call.
+///
+/// Entries are also bounded in *compiled* size: a short pattern such as
+/// `\w{90}` compiles to megabytes, so only patterns that compile within
+/// [`MATCHES_CACHE_MAX_COMPILED`] are retained, keeping the cache to roughly
+/// 256 × 256 KiB at worst.
+static MATCHES_CACHE: LazyLock<RwLock<HashMap<String, Regex>>> =
+    LazyLock::new(|| RwLock::new(HashMap::new()));
 const MATCHES_CACHE_CAPACITY: usize = 256;
+const MATCHES_CACHE_MAX_PATTERN: usize = 1024;
+const MATCHES_CACHE_MAX_COMPILED: usize = 256 * 1024;
 
 /// Custom regex validator.
 ///
@@ -552,26 +635,70 @@ const MATCHES_CACHE_CAPACITY: usize = 256;
 ///
 /// Patterns should come from the application, not from requests: the `regex`
 /// engine matches in linear time, but compiling a pattern can be expensive.
+///
+/// With the `(?m)` flag, `^` and `$` match at line boundaries, so
+/// `Matches::new("(?m)^[a-z]+$")` accepts `"abc\n<x>"`; [`Matches::full`]
+/// anchors with `\A`/`\z`, which always mean the ends of the value.
 pub struct Matches(pub Regex);
 
 impl Matches {
     /// Compile `pattern`, reusing an earlier compilation of the same pattern.
     pub fn new(pattern: &str) -> Result<Self, regex::Error> {
-        let cache = || MATCHES_CACHE.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(regex) = cache().get(pattern) {
+        if let Some(regex) = MATCHES_CACHE
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(pattern)
+        {
             return Ok(Self(regex.clone()));
         }
-        let regex = Regex::new(pattern)?;
-        let mut cache = cache();
-        if cache.len() < MATCHES_CACHE_CAPACITY {
+        // Try a compile small enough to cache; a pattern that does not fit is
+        // compiled again under the default limit and returned uncached.
+        let small = (pattern.len() <= MATCHES_CACHE_MAX_PATTERN)
+            .then(|| {
+                regex::RegexBuilder::new(pattern)
+                    .size_limit(MATCHES_CACHE_MAX_COMPILED)
+                    .build()
+            })
+            .and_then(|r| match r {
+                Err(regex::Error::CompiledTooBig(_)) => None,
+                other => Some(other),
+            })
+            .transpose()?;
+        let Some(regex) = small else {
+            return Ok(Self(Regex::new(pattern)?));
+        };
+        {
+            let mut cache = MATCHES_CACHE.write().unwrap_or_else(|e| e.into_inner());
+            if cache.len() >= MATCHES_CACHE_CAPACITY
+                && let Some(victim) = cache.keys().next().cloned()
+            {
+                cache.remove(&victim);
+            }
             cache.insert(pattern.to_owned(), regex.clone());
         }
         Ok(Self(regex))
     }
 
     /// Like [`Matches::new`], but the pattern must match the whole value.
+    ///
+    /// The pattern is compiled on its own first, so one with an unbalanced
+    /// `)` is an error rather than a way to close the anchoring group early
+    /// (`a)|(?:b` would otherwise become `^(?:a)|(?:b)$`).
     pub fn full(pattern: &str) -> Result<Self, regex::Error> {
-        Self::new(&format!("^(?:{pattern})$"))
+        let anchored = format!(r"\A(?:{pattern})\z");
+        // Only a pattern not seen before needs the stand-alone check; a cached
+        // anchored form was checked when it was inserted.
+        if !Self::cached(&anchored) {
+            Regex::new(pattern)?;
+        }
+        Self::new(&anchored)
+    }
+
+    fn cached(pattern: &str) -> bool {
+        MATCHES_CACHE
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(pattern)
     }
 
     pub fn validate(&self, value: &str, field: &str) -> Result<(), ValidationError> {
@@ -886,6 +1013,17 @@ mod tests {
         }
         assert!(Min(f32::MIN).validate(f32::NAN, "x").is_err());
         assert!(Min(0.5).validate(0.5, "x").is_ok());
+        // A NaN bound admits nothing rather than everything.
+        assert!(Min(f64::NAN).validate(-1e300, "x").is_err());
+        assert!(Max(f64::NAN).validate(1e300, "x").is_err());
+        assert!(
+            InRange {
+                min: f64::NAN,
+                max: 1.0
+            }
+            .validate(0.5, "x")
+            .is_err()
+        );
         assert!(Max(0.5).validate(0.5, "x").is_ok());
     }
 
@@ -918,6 +1056,11 @@ mod tests {
             "\u{115F}",
             "\u{00AD}",
             "\u{180E}",
+            "\u{0301}",
+            "\u{20E3}",
+            "\u{1D159}",
+            "\u{1F3FB}",
+            "\u{FFFC}",
             "\u{202E}",
             "\0",
             " \u{200B}\t",
@@ -989,12 +1132,37 @@ mod tests {
             "https://example.com:/",
             "https://example.com:99999/",
             "https://example.com:+80/",
+            "https://example.com:0443/",
+            "http://example.com:080/",
+            "http://example.com:0/",
+            "https://example.com//evil.example/x",
+            // Malformed percent-escapes.
+            "https://example.com/%zz",
+            "https://example.com/%",
+            "https://example.com/a%2",
+            "https://example.com/?a=%G1",
+            // Over DNS length limits.
+            "https://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.example/",
         ] {
             assert!(
                 IsUrl::validate(value, "url").is_err(),
                 "IsUrl accepted {value:?}"
             );
         }
+    }
+
+    #[test]
+    fn is_url_enforces_dns_length_limits() {
+        let label = |n| "a".repeat(n);
+        assert!(IsUrl::validate(&format!("https://{}.io/", label(63)), "url").is_ok());
+        assert!(IsUrl::validate(&format!("https://{}.io/", label(64)), "url").is_err());
+        // Four labels of 63 plus separators = 255 > 253.
+        let long = [label(63), label(63), label(63), label(63)].join(".");
+        assert!(IsUrl::validate(&format!("https://{long}/"), "url").is_err());
+        let ok = [label(63), label(63), label(63), label(61)].join(".");
+        assert_eq!(ok.len(), 253);
+        assert!(IsUrl::validate(&format!("https://{ok}/"), "url").is_ok());
+        assert!(IsUrl::validate(&format!("https://{ok}./"), "url").is_ok());
     }
 
     #[test]
@@ -1011,6 +1179,12 @@ mod tests {
             "https://example.com/caf%C3%A9?a=b&c=d",
             "https://example.com.",
             "https://under_score.example/",
+            // Query or fragment directly after the host: the parser inserts
+            // the empty path's `/`, and that alone is not a rewrite.
+            "https://example.com?x=1",
+            "https://example.com#frag",
+            "https://example.com:8443?x",
+            "https://example.com/%2F",
         ] {
             assert!(
                 IsUrl::validate(value, "url").is_ok(),
@@ -1031,17 +1205,41 @@ mod tests {
         assert!(full.validate("abc", "f").is_ok());
         assert!(full.validate("1<x>a", "f").is_err());
         // Alternation must stay inside the anchors.
+        // An unbalanced pattern must not escape the anchors.
+        assert!(Matches::full("a)|(?:b").is_err());
+        assert!(Matches::full("[a-z]+)|(?:x").is_err());
         let alt = Matches::full("a|b").unwrap();
         assert!(alt.validate("ab", "f").is_err());
         assert!(alt.validate("b", "f").is_ok());
     }
 
     #[test]
+    fn matches_cache_stays_bounded() {
+        for i in 0..(MATCHES_CACHE_CAPACITY + 50) {
+            Matches::new(&format!("^bounded-{i}$")).unwrap();
+        }
+        let len = MATCHES_CACHE.read().unwrap().len();
+        assert!(len <= MATCHES_CACHE_CAPACITY, "cache grew to {len}");
+        // A short pattern with a large compiled form is not retained.
+        let big = r"\w{200}";
+        assert!(
+            Matches::new(big)
+                .unwrap()
+                .validate(&"a".repeat(200), "f")
+                .is_ok()
+        );
+        assert!(!Matches::cached(big), "large compiled pattern was cached");
+    }
+
+    #[test]
     fn matches_new_reuses_compiled_patterns_and_reports_bad_ones() {
-        let a = Matches::new("^cache-me-[0-9]+$").unwrap();
-        let b = Matches::new("^cache-me-[0-9]+$").unwrap();
-        assert_eq!(a.0.as_str(), b.0.as_str());
-        assert!(b.validate("cache-me-42", "f").is_ok());
+        let pattern = "^cache-me-[0-9]+$";
+        let a = Matches::new(pattern).unwrap();
+        assert!(Matches::cached(pattern));
+        assert!(a.validate("cache-me-42", "f").is_ok());
+        let long = format!("^{}$", "x".repeat(MATCHES_CACHE_MAX_PATTERN));
+        assert!(Matches::new(&long).is_ok());
+        assert!(!Matches::cached(&long), "oversized pattern was cached");
         assert!(Matches::new("(unclosed").is_err());
         // A failed compile is not cached as a success.
         assert!(Matches::new("(unclosed").is_err());

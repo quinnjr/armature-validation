@@ -17,7 +17,8 @@
 //!   parsed host verbatim;
 //! * `IsEmail` must respect the RFC 5321 length limits and dot rules;
 //! * the numeric validators must never accept a NaN or an infinity, read here
-//!   from the input's leading bytes;
+//!   from the input's leading bytes as both an `f64` and an `f32`;
+//! * `Matches::full` must anchor to the whole value;
 //! * `IsAlpha`, `IsAlphanumeric` and `IsNumeric` must agree with Rust's own
 //!   character classification, and must not disagree with each other;
 //! * `MinLength` and `MaxLength` must bound `char`s rather than bytes, which
@@ -30,7 +31,7 @@
 #![no_main]
 
 use armature_validation::{
-    InRange, IsAlpha, IsAlphanumeric, IsEmail, IsNumeric, IsPositive, IsUrl, IsUuid, Max,
+    InRange, IsAlpha, IsAlphanumeric, IsEmail, IsNumeric, IsPositive, IsUrl, IsUuid, Matches, Max,
     MaxLength, Min, MinLength, NotEmpty,
 };
 use libfuzzer_sys::fuzz_target;
@@ -38,12 +39,35 @@ use libfuzzer_sys::fuzz_target;
 fuzz_target!(|data: &[u8]| {
     // Every bit pattern is a float, NaNs and infinities included; none of the
     // bounds may let a non-finite one through.
+    if let Some(bytes) = data.get(..4) {
+        let x = f32::from_le_bytes(bytes.try_into().unwrap());
+        let accepted = [
+            Min(f32::MIN).validate(x, "n").is_ok(),
+            Max(f32::MAX).validate(x, "n").is_ok(),
+            InRange {
+                min: f32::MIN,
+                max: f32::MAX,
+            }
+            .validate(x, "n")
+            .is_ok(),
+            IsPositive::validate(x, "n").is_ok(),
+        ];
+        assert!(
+            x.is_finite() || !accepted.contains(&true),
+            "a numeric validator accepted non-finite f32 {x}: {accepted:?}",
+        );
+    }
     if let Some(bytes) = data.get(..8) {
         let x = f64::from_le_bytes(bytes.try_into().unwrap());
         let accepted = [
             Min(f64::MIN).validate(x, "n").is_ok(),
             Max(f64::MAX).validate(x, "n").is_ok(),
-            InRange { min: f64::MIN, max: f64::MAX }.validate(x, "n").is_ok(),
+            InRange {
+                min: f64::MIN,
+                max: f64::MAX,
+            }
+            .validate(x, "n")
+            .is_ok(),
             IsPositive::validate(x, "n").is_ok(),
         ];
         assert!(
@@ -117,6 +141,39 @@ fuzz_target!(|data: &[u8]| {
             value.to_ascii_lowercase().contains(&format!("//{host}")),
             "IsUrl accepted {value:?}, whose parsed host {host:?} is not written in it",
         );
+        // The whole-string form of the contract: the serialisation is the
+        // input with only the changes the parser may make without changing
+        // meaning (lower-case scheme and host, an elided default port, the
+        // empty path's `/`).
+        assert_eq!(
+            parsed.as_str(),
+            canonical_url(value),
+            "IsUrl accepted {value:?}, which the parser rewrote",
+        );
+        // Every `%` starts a two-hex-digit escape.
+        let bytes = value.as_bytes();
+        assert!(
+            bytes.iter().enumerate().all(|(i, &b)| b != b'%'
+                || bytes
+                    .get(i + 1..i + 3)
+                    .is_some_and(|h| h.iter().all(u8::is_ascii_hexdigit))),
+            "IsUrl accepted {value:?}, which has a malformed percent-escape",
+        );
+    }
+
+    // `Matches::full` anchors to the whole value: the escaped value matches
+    // itself and nothing longer. Kept short, since each input compiles a regex.
+    if value.len() <= 32 {
+        let full = Matches::full(&regex::escape(value)).expect("an escaped literal compiles");
+        assert!(
+            full.validate(value, FIELD).is_ok(),
+            "full({value:?}) rejected itself"
+        );
+        let longer = format!("{value}x");
+        assert!(
+            full.validate(&longer, FIELD).is_err(),
+            "full({value:?}) accepted {longer:?}",
+        );
     }
 
     // Character-class validators must agree with the standard library, and are
@@ -126,7 +183,10 @@ fuzz_target!(|data: &[u8]| {
             !value.is_empty() && value.chars().all(|c| c.is_alphabetic()),
             "IsAlpha accepted {value:?}",
         );
-        assert!(is_alnum, "IsAlpha accepted {value:?} but IsAlphanumeric did not");
+        assert!(
+            is_alnum,
+            "IsAlpha accepted {value:?} but IsAlphanumeric did not"
+        );
     }
     if is_numeric {
         assert!(
@@ -192,3 +252,23 @@ fuzz_target!(|data: &[u8]| {
         chars + 1,
     );
 });
+
+/// `value` (an ASCII `scheme://authority[tail]` string) with the only rewrites
+/// a WHATWG parser may apply to a URL `IsUrl` accepts.
+fn canonical_url(value: &str) -> String {
+    let (scheme, rest) = value.split_once("://").expect("IsUrl requires `://`");
+    let scheme = scheme.to_ascii_lowercase();
+    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let (authority, tail) = rest.split_at(end);
+    let mut authority = authority.to_ascii_lowercase();
+    let default = if scheme == "https" { ":443" } else { ":80" };
+    if authority.ends_with(default) {
+        authority.truncate(authority.len() - default.len());
+    }
+    let tail = if tail.starts_with('/') {
+        tail.to_owned()
+    } else {
+        format!("/{tail}")
+    };
+    format!("{scheme}://{authority}{tail}")
+}

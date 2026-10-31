@@ -11,7 +11,7 @@ Earlier changes are recorded in the workspace [`CHANGELOG.md`](https://github.co
 
 ### Security
 
-- **Submitted values no longer reach clients or logs (breaking).** Every
+- **Submitted values no longer reach clients or error output (breaking).** Every
   built-in validator copied the rejected input into `ValidationError::value`,
   and `ValidationPipe::parse` and `validate!` put `format!("{:?}", errors)` into
   an `Error::BadRequest`, which `armature-core` passes to the client verbatim.
@@ -25,31 +25,43 @@ Earlier changes are recorded in the workspace [`CHANGELOG.md`](https://github.co
   - `ValidationPipe::parse` and `validate!` return `Error::Validation` with
     `ValidationErrors::client_message()` (`field: message` pairs) instead of
     `Debug` text.
-- **`ValidationPipe::parse` no longer exposes serde's error text.** A body that
-  does not deserialize maps to `Error::Deserialization`, which `armature-core`
-  redacts, instead of `BadRequest("Invalid JSON: …")`, which quoted the input
-  and named the target type's fields and enum variants.
+- **`ValidationPipe::parse` no longer exposes serde's error text (breaking).**
+  A body that does not deserialize maps to `Error::Deserialization` instead of
+  `BadRequest("Invalid JSON: …")`, which quoted the input and named the target
+  type's fields and enum variants. `armature-core` sends the client a generic
+  message for that variant, and the variant itself carries only serde's error
+  category and position, so the value does not reach core's debug log either.
+  Code matching on `Error::BadRequest` from `parse` or `validate!` must now
+  match `Error::Validation` / `Error::Deserialization`.
 - **`Min`, `Max`, `InRange` and `IsPositive` reject NaN and infinities.**
   `Min(0.0)` and `Max(100.0)` both accepted `f64::NAN` (every comparison with
   NaN is false), and `"NaN".parse::<f64>()` is how a query parameter becomes
-  one.
+  one. A NaN *bound* now rejects every value instead of accepting every value.
 - **`IsUrl` accepts only URLs the parser reads exactly as written.** Beyond the
   control-character check, it accepted strings the WHATWG parser rewrites, so
   the caller kept a different URL from the one examined: `https:\\evil.com`,
   `https:evil.com`, `https://ex%61mple.com`, zero-width and fullwidth
   characters in the host, IPv4 shorthands (`http://0x7f.1/`), and
   `https://trusted.example@evil.example/`. It now requires RFC 3986
-  characters only (non-ASCII hosts must be given in `xn--` form), a literal
-  `http://`/`https://`, no userinfo, and a host, port and remainder the parser
-  left unchanged. Documented as a syntax check, not an SSRF filter.
+  characters only, well-formed `%XX` escapes, a literal `http://`/`https://`,
+  no userinfo, a host within DNS length limits, and a host, port and remainder
+  the parser left unchanged; port 0 and a path beginning with `//` (a
+  protocol-relative open redirect when the path is used on its own) are also
+  rejected. Documented as a syntax check, not an SSRF filter.
+  Previously-accepted inputs that are now **rejected** (breaking): non-ASCII
+  hosts or paths (give hosts in `xn--` form and percent-encode paths);
+  characters the parser encodes, such as `'` in a query or `` ` ``, `{`, `|`,
+  `^`; non-canonical IPv6 (`[0:0::1]`, `[::ffff:127.0.0.1]`); ports with
+  leading zeros (`:0443`); dot segments (`/a/../b`); malformed `%` escapes.
 - **`validate_parallel` no longer copies a validator's panic message into the
   returned error.** A panicking validator now fails its own field closed
   (`validationFailed`) without discarding other fields' errors, and the call
   falls back to the synchronous path outside a Tokio runtime instead of
   panicking.
 - **`NotEmpty` rejects invisible-only values** (zero-width spaces, bidi
-  controls, Hangul fillers, the braille blank and similar), which displayed as
-  blank while passing a `trim()` check.
+  controls, Hangul fillers, the braille blank, combining marks with nothing to
+  combine with, and similar), which displayed as blank while passing a
+  `trim()` check. Control-only values such as `"\0"` are rejected too.
 - **`IsEmail` enforces RFC 5321 lengths and dot-atom rules**: at most 64
   octets before the `@` and 254 in total, and no leading, trailing or
   consecutive dots in the local part.
@@ -58,7 +70,10 @@ Earlier changes are recorded in the workspace [`CHANGELOG.md`](https://github.co
 
 - `validate!` referred to `armature_core::Error` and called `.validate()`
   through whatever trait was in scope, so it did not compile for a crate that
-  depended only on `armature-validation`. It now uses `$crate` paths.
+  depended only on `armature-validation`. It now uses `$crate` paths and calls
+  `armature_validation::Validate::validate`, so the DTO must implement this
+  crate's `Validate` (a type with only an inherent `validate` method no
+  longer works with the macro).
 - `validate_parallel` returns errors in rule order, matching `validate`.
 - README: the install line named `0.1`, the license was given as
   `MIT OR Apache-2.0` (the crate is `Apache-2.0`), and it advertised
@@ -67,19 +82,30 @@ Earlier changes are recorded in the workspace [`CHANGELOG.md`](https://github.co
 
 ### Added
 
-- `Min`, `Max`, `InRange` and `IsPositive::validate` are generic over every
-  primitive integer and float type (the sealed `Numeric` trait); they were
-  limited to `i32` (and `f64` for `Min`/`Max`).
-- `Matches::full`, which anchors the pattern to the whole value. `Matches`
-  itself matches anywhere in the value, which is now documented.
+- The sealed `Numeric` trait. `Min`, `Max`, `InRange` and the new
+  `IsPositive::validate` are generic over every primitive integer and float
+  type; they were limited to `i32` (and `f64` for `Min`/`Max`).
+- `Matches::full`, which anchors the pattern to the whole value (and rejects
+  a pattern that is not valid on its own, so it cannot close the anchoring
+  group early). `Matches` itself matches anywhere in the value, which is now
+  documented.
 - `ValidationErrors::to_json_with_values` and `client_message`.
 - `IsNumeric` and `IsUuid` in the prelude.
+- `ValidationPipe::parse_strict`, which also requires a JSON `Content-Type`
+  (415 otherwise), for cookie-authenticated endpoints that a cross-site
+  `text/plain` form post could otherwise reach.
 
 ### Changed
 
-- `Matches::new` caches compiled patterns (up to 256), so the derive's
-  `regex` rule, which builds a `Matches` on every `validate()` call, no longer
+- `Matches::new` caches compiled patterns (up to 256 patterns of at most 1 KiB
+  source and 256 KiB compiled, evicting one entry per insertion when full), so the derive's `regex`
+  rule, which builds a `Matches` on every `validate()` call, no longer
   recompiles the pattern per request.
+- `ValidationErrors::client_message` does not repeat the field name when the
+  message already starts with it, lists at most 20 errors, and replaces
+  control characters with spaces so a caller-written field or message cannot
+  break the line.
+- `ValidationContext`'s `Debug` lists keys only, not the request data.
 - `MaxLength` stops counting once the limit is exceeded.
 - Dependencies: `once_cell` replaced by `std::sync::LazyLock`; `tokio` trimmed
   to the `rt` feature (`macros` moved to dev-dependencies); `serde`'s `derive`

@@ -12,6 +12,11 @@ on:
 permissions:
   contents: read
 
+# A new push to the same PR supersedes the run in progress.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -19,6 +24,7 @@ jobs:
   audit:
     name: cargo audit
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
@@ -32,3 +38,7 @@ jobs:
       # a consumer would resolve today.
       - run: cargo generate-lockfile
       - run: cargo audit --deny warnings
+      # The fuzz harness is its own workspace with its own (also uncommitted)
+      # lockfile; its dependencies run in CI too.
+      - run: cargo generate-lockfile --manifest-path fuzz/Cargo.toml
+      - run: cargo audit --deny warnings --file fuzz/Cargo.lock

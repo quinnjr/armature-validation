@@ -20,6 +20,17 @@ updates:
         update-types:
           - "patch"
 
+  # The fuzz harness is its own workspace, so it needs its own entry.
+  - package-ecosystem: "cargo"
+    directory: "/fuzz"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    commit-message:
+      prefix: "deps(fuzz)"
+    labels:
+      - "dependencies"
+
   # Keeps the SHA-pinned actions in .github/workflows current.
   - package-ecosystem: "github-actions"
     directory: "/"
