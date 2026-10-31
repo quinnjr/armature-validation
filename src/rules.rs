@@ -155,6 +155,18 @@ impl ValidationBuilder {
     /// independent, latency-bound work (for example custom async checks wrapped
     /// in blocking validators); otherwise prefer the synchronous method.
     ///
+    /// # Runtime
+    ///
+    /// Tasks are spawned on the current [`tokio`] runtime. Called outside one,
+    /// this falls back to [`ValidationBuilder::validate`] rather than panicking.
+    ///
+    /// # Panics in validators
+    ///
+    /// A validator that panics fails validation closed: the field gets a
+    /// generic `validationFailed` error. The panic payload is not copied into
+    /// the error, since it may name internals or carry data, and errors are
+    /// sent to clients.
+    ///
     /// # Examples
     ///
     /// ```no_run
@@ -181,7 +193,13 @@ impl ValidationBuilder {
     ) -> Result<(), Vec<ValidationError>> {
         use tokio::task::JoinSet;
 
+        if tokio::runtime::Handle::try_current().is_err() {
+            return self.validate(data);
+        }
+
         let mut set = JoinSet::new();
+        // Field of each spawned rule, by spawn order.
+        let mut order_of: Vec<String> = Vec::new();
 
         // Spawn validation tasks for each field. Missing-field handling goes
         // through the same `value_for` as the synchronous path, so the two
@@ -194,6 +212,8 @@ impl ValidationBuilder {
             let field = rule.field.clone();
             let validators = rule.validators.clone();
 
+            let order = order_of.len();
+            order_of.push(field.clone());
             set.spawn(async move {
                 let mut errors = Vec::new();
                 for validator in &validators {
@@ -201,25 +221,31 @@ impl ValidationBuilder {
                         errors.push(error);
                     }
                 }
-                errors
+                (order, errors)
             });
         }
 
-        // Collect all errors from parallel validations
-        let mut all_errors = Vec::new();
+        // Collect per rule, then flatten in rule order so the result matches
+        // the synchronous path regardless of which task finished first. A rule
+        // whose task did not complete (it panicked) fails closed.
+        let mut per_rule: Vec<Option<Vec<ValidationError>>> = vec![None; order_of.len()];
         while let Some(result) = set.join_next().await {
-            match result {
-                Ok(mut errors) => all_errors.append(&mut errors),
-                Err(e) => {
-                    return Err(vec![ValidationError {
-                        field: "unknown".to_string(),
-                        message: format!("Validation task failed: {}", e),
-                        constraint: "task_error".to_string(),
-                        value: None,
-                    }]);
-                }
+            if let Ok((order, errors)) = result {
+                per_rule[order] = Some(errors);
             }
         }
+        let all_errors: Vec<ValidationError> = per_rule
+            .into_iter()
+            .zip(order_of)
+            .flat_map(|(errors, field)| {
+                errors.unwrap_or_else(|| {
+                    vec![
+                        ValidationError::new(&field, format!("{} could not be validated", field))
+                            .with_constraint("validationFailed"),
+                    ]
+                })
+            })
+            .collect();
 
         if all_errors.is_empty() {
             Ok(())
@@ -316,5 +342,46 @@ mod tests {
         let mut present = std::collections::HashMap::new();
         present.insert("website".to_string(), "not a url".to_string());
         assert!(validator.validate(&present).is_err());
+    }
+
+    /// A panicking validator fails its field closed, without leaking the panic
+    /// payload, and without discarding other fields' errors.
+    #[tokio::test]
+    async fn parallel_panic_fails_closed_without_leaking_payload() {
+        let validator = ValidationBuilder::new()
+            .field(ValidationRules::for_field("a").add(NotEmpty::validate))
+            .field(ValidationRules::for_field("b").add(
+                |_: &str, _: &str| -> Result<(), ValidationError> { panic!("db password=s3cr3t") },
+            ));
+        let errors = validator
+            .validate_parallel(&std::collections::HashMap::new())
+            .await
+            .expect_err("both fields must fail");
+        let fields: Vec<_> = errors.iter().map(|e| e.field.as_str()).collect();
+        assert_eq!(fields, ["a", "b"]);
+        assert!(errors.iter().all(|e| !e.message.contains("s3cr3t")));
+        assert_eq!(errors[1].constraint, "validationFailed");
+    }
+
+    /// Outside a runtime the parallel path degrades to the synchronous one.
+    #[test]
+    fn parallel_without_runtime_falls_back_to_sync() {
+        let validator = signup_validator();
+        let data = std::collections::HashMap::new();
+        let errors = block_on_ready(validator.validate_parallel(&data))
+            .expect_err("missing fields must fail");
+        assert!(errors.iter().any(|e| e.field == "email"));
+    }
+
+    /// Minimal executor: polls a future that never actually waits.
+    fn block_on_ready<F: std::future::Future>(fut: F) -> F::Output {
+        use std::task::{Context, Poll, Waker};
+        let mut fut = std::pin::pin!(fut);
+        let mut cx = Context::from_waker(Waker::noop());
+        loop {
+            if let Poll::Ready(out) = fut.as_mut().poll(&mut cx) {
+                return out;
+            }
+        }
     }
 }

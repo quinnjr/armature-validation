@@ -161,6 +161,11 @@ pub use validators::*;
 /// field-attribute syntax.
 pub use armature_proc_macro::Validate;
 
+// Compile the README's examples, so they cannot drift from the crate.
+#[cfg(doctest)]
+#[doc = include_str!("../README.md")]
+struct ReadmeDoctests;
+
 /// Prelude for common imports.
 ///
 /// ```
@@ -173,16 +178,8 @@ pub mod prelude {
     pub use crate::traits::{Validate, Validator};
     // Derive macro (macro namespace) alongside the `Validate` trait (type namespace).
     pub use crate::validators::{
-        InRange, IsAlpha, IsAlphanumeric, IsEmail, IsPositive, IsUrl, Matches, Max, MaxLength, Min,
-        MinLength, NotEmpty,
+        InRange, IsAlpha, IsAlphanumeric, IsEmail, IsNumeric, IsPositive, IsUrl, IsUuid, Matches,
+        Max, MaxLength, Min, MinLength, NotEmpty,
     };
     pub use armature_proc_macro::Validate;
-}
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn test_module_exports() {
-        // Ensure module compiles
-    }
 }

@@ -5,9 +5,87 @@ All notable changes to this crate will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this crate adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-Earlier changes are recorded in the workspace [`CHANGELOG.md`](../CHANGELOG.md).
+Earlier changes are recorded in the workspace [`CHANGELOG.md`](https://github.com/quinnjr/armature/blob/main/CHANGELOG.md).
 
 ## [Unreleased]
+
+### Security
+
+- **Submitted values no longer reach clients or logs (breaking).** Every
+  built-in validator copied the rejected input into `ValidationError::value`,
+  and `ValidationPipe::parse` and `validate!` put `format!("{:?}", errors)` into
+  an `Error::BadRequest`, which `armature-core` passes to the client verbatim.
+  A password that failed `length(min = 8)` — the README's own example — came
+  back in the 400 body and was logged by the request logger.
+  - The built-in validators no longer set `value`; `with_value` remains for
+    callers who opt in on a non-sensitive field.
+  - `ValidationErrors::to_json` (and so `ValidationPipe::error_response`)
+    omits `value`; `to_json_with_values` opts in.
+  - `ValidationError`'s `Debug` output redacts `value`.
+  - `ValidationPipe::parse` and `validate!` return `Error::Validation` with
+    `ValidationErrors::client_message()` (`field: message` pairs) instead of
+    `Debug` text.
+- **`ValidationPipe::parse` no longer exposes serde's error text.** A body that
+  does not deserialize maps to `Error::Deserialization`, which `armature-core`
+  redacts, instead of `BadRequest("Invalid JSON: …")`, which quoted the input
+  and named the target type's fields and enum variants.
+- **`Min`, `Max`, `InRange` and `IsPositive` reject NaN and infinities.**
+  `Min(0.0)` and `Max(100.0)` both accepted `f64::NAN` (every comparison with
+  NaN is false), and `"NaN".parse::<f64>()` is how a query parameter becomes
+  one.
+- **`IsUrl` accepts only URLs the parser reads exactly as written.** Beyond the
+  control-character check, it accepted strings the WHATWG parser rewrites, so
+  the caller kept a different URL from the one examined: `https:\\evil.com`,
+  `https:evil.com`, `https://ex%61mple.com`, zero-width and fullwidth
+  characters in the host, IPv4 shorthands (`http://0x7f.1/`), and
+  `https://trusted.example@evil.example/`. It now requires RFC 3986
+  characters only (non-ASCII hosts must be given in `xn--` form), a literal
+  `http://`/`https://`, no userinfo, and a host, port and remainder the parser
+  left unchanged. Documented as a syntax check, not an SSRF filter.
+- **`validate_parallel` no longer copies a validator's panic message into the
+  returned error.** A panicking validator now fails its own field closed
+  (`validationFailed`) without discarding other fields' errors, and the call
+  falls back to the synchronous path outside a Tokio runtime instead of
+  panicking.
+- **`NotEmpty` rejects invisible-only values** (zero-width spaces, bidi
+  controls, Hangul fillers, the braille blank and similar), which displayed as
+  blank while passing a `trim()` check.
+- **`IsEmail` enforces RFC 5321 lengths and dot-atom rules**: at most 64
+  octets before the `@` and 254 in total, and no leading, trailing or
+  consecutive dots in the local part.
+
+### Fixed
+
+- `validate!` referred to `armature_core::Error` and called `.validate()`
+  through whatever trait was in scope, so it did not compile for a crate that
+  depended only on `armature-validation`. It now uses `$crate` paths.
+- `validate_parallel` returns errors in rule order, matching `validate`.
+- README: the install line named `0.1`, the license was given as
+  `MIT OR Apache-2.0` (the crate is `Apache-2.0`), and it advertised
+  customizable error messages the derive does not support. Its examples are
+  now compiled as doc tests.
+
+### Added
+
+- `Min`, `Max`, `InRange` and `IsPositive::validate` are generic over every
+  primitive integer and float type (the sealed `Numeric` trait); they were
+  limited to `i32` (and `f64` for `Min`/`Max`).
+- `Matches::full`, which anchors the pattern to the whole value. `Matches`
+  itself matches anywhere in the value, which is now documented.
+- `ValidationErrors::to_json_with_values` and `client_message`.
+- `IsNumeric` and `IsUuid` in the prelude.
+
+### Changed
+
+- `Matches::new` caches compiled patterns (up to 256), so the derive's
+  `regex` rule, which builds a `Matches` on every `validate()` call, no longer
+  recompiles the pattern per request.
+- `MaxLength` stops counting once the limit is exceeded.
+- Dependencies: `once_cell` replaced by `std::sync::LazyLock`; `tokio` trimmed
+  to the `rt` feature (`macros` moved to dev-dependencies); `serde`'s `derive`
+  feature moved to dev-dependencies.
+- The published package is limited to the library, tests, benches and docs
+  (no CI, fuzz or hook configuration).
 
 ## [0.7.0] - 2026-10-29
 
@@ -74,26 +152,15 @@ Earlier changes are recorded in the workspace [`CHANGELOG.md`](../CHANGELOG.md).
   was used next — a `Location` header being the obvious route to response
   splitting. The check now uses the parser's own predicate rather than
   `char::is_control()`, which misses `U+0020`.
-
-### Added
-
-- Adopted the `validation` criterion benchmark from the root package's `benches/`. Run it with `cargo bench -p armature-validation --bench validation`. The crate now sets `autobenches = false`, so a new file under `benches/` needs an explicit `[[bench]]` entry.
-
-### Fixed
-
-- **Breaking:** a field with rules that is absent from the input now fails validation. It was silently skipped, so a form missing `email` entirely passed `NotEmpty` and `IsEmail`; `ValidationRules::optional()` opts out.
-- `IsUuid` accepts uppercase and checks version/variant; `IsUrl` parses with the `url` crate instead of a regex that rejected `https://a` and accepted `https://!!`.
-
-### Fixed
-
-- A field with rules but **absent** from the input was silently skipped, so a form that simply omitted `email` passed `NotEmpty` and `IsEmail`. A missing required field is now validated as `""`; mark genuinely optional fields with the new `ValidationRules::optional()`. Applies to both `validate` and `validate_parallel`.
+- **Breaking:** a field with rules but **absent** from the input was silently skipped, so a form that simply omitted `email` passed `NotEmpty` and `IsEmail`. A missing required field is now validated as `""`; mark genuinely optional fields with the new `ValidationRules::optional()`. Applies to both `validate` and `validate_parallel`.
 - `IsUuid` accepted only lowercase and checked neither version nor variant. It is now case-insensitive per RFC 9562 §4, constrains the version to 1–8 and the variant to 8/9/a/b, and permits the nil and max UUIDs.
 - `IsUrl` parses with the `url` crate instead of pattern matching. It previously rejected valid URLs with a single-label host (`https://a`) and accepted invalid ones (`https://!!`).
 
 ### Added
 
+- Adopted the `validation` criterion benchmark from the root package's `benches/`. Run it with `cargo bench -p armature-validation --bench validation`. The crate now sets `autobenches = false`, so a new file under `benches/` needs an explicit `[[bench]]` entry.
 - `ValidationRules::optional()`, `is_optional()` and `field_name()`.
 
-### Changed — `0.1.3` → `0.1.4`
+### Changed
 
-- Migrated onto `armature-core` `0.8`'s `Bytes`-backed request and response types. No behavior change beyond what that migration implies; see [`armature-core/CHANGELOG.md`](../armature-core/CHANGELOG.md).
+- (0.1.4) Migrated onto `armature-core` `0.8`'s `Bytes`-backed request and response types. No behavior change beyond what that migration implies; see the [`armature-core` changelog](https://github.com/quinnjr/armature-core/blob/main/CHANGELOG.md).

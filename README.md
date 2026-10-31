@@ -8,13 +8,13 @@ Request validation for the Armature framework.
 - **Built-in Rules** - Email, URL, length, range, regex, etc.
 - **Custom Validators** - Create your own validation rules
 - **Nested Validation** - Validate nested structs
-- **Error Messages** - Customizable error messages
+- **Client-safe errors** - Error responses never echo the submitted values
 
 ## Installation
 
 ```toml
 [dependencies]
-armature-validation = "0.1"
+armature-validation = "0.7"
 ```
 
 ## Quick Start
@@ -42,23 +42,39 @@ fn create_user(data: CreateUser) -> Result<(), Vec<ValidationError>> {
     // Process valid data
     Ok(())
 }
+
+let short_password = CreateUser {
+    username: "alice".into(),
+    email: "alice@example.com".into(),
+    password: "hunter2".into(),
+    age: 30,
+};
+assert!(create_user(short_password).is_err());
 ```
 
 ## Available Validators
 
 | Validator | Description |
 |-----------|-------------|
-| `email` | Valid email address |
-| `url` | Valid URL |
-| `length(min, max)` | String length bounds |
+| `email` | Valid email address (RFC 5321 lengths, dot-atom local part) |
+| `url` | Absolute `http`/`https` URL, exactly as the URL parser reads it |
+| `length(min, max)` | String length bounds, in characters |
 | `range(min, max)` | Numeric range |
-| `regex(pattern)` | Regex match |
-| `required` | Non-empty value |
+| `regex(pattern)` | Regex match **anywhere** in the value; anchor with `^…$` for a full match |
+| `required` | Has visible content (not empty, whitespace or invisible characters) |
 | `custom(fn)` | Custom function |
+
+`url` is a syntax check, not an SSRF filter: `http://127.0.0.1/` is a valid URL.
+Vet the destination before fetching a user-supplied URL from the server.
 
 ## Custom Validators
 
+A custom function receives the field's value only, so the error names the
+field itself:
+
 ```rust
+use armature_validation::{Validate, ValidationError};
+
 fn validate_username(username: &str) -> Result<(), ValidationError> {
     if username.contains(' ') {
         return Err(ValidationError::new("username", "No spaces allowed"));
@@ -71,9 +87,20 @@ struct User {
     #[validate(custom = "validate_username")]
     username: String,
 }
+
+assert!(User { username: "a b".into() }.validate().is_err());
 ```
+
+## Error Output
+
+Validation errors are sent to clients, so the submitted value is never part of
+them: the built-in validators do not record it, `ValidationErrors::to_json`
+leaves it out, and `Debug` output redacts it. `ValidationPipe::parse` and the
+`validate!` macro return `armature_core::Error::Validation` with `field: message`
+pairs, and a body that fails to deserialize returns
+`armature_core::Error::Deserialization`, whose detail the framework does not
+send to the client.
 
 ## License
 
-MIT OR Apache-2.0
-
+Apache-2.0

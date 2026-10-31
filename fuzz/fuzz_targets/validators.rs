@@ -12,7 +12,12 @@
 //! * anything `IsUuid` accepts must parse as a UUID;
 //! * anything `IsUrl` accepts must parse as an absolute `http`/`https` URL,
 //!   which is the property its doc claims and the reason it exists rather than
-//!   a bare regex;
+//!   a bare regex — and must be a string the parser did not have to rewrite:
+//!   ASCII, free of spaces and backslashes, without userinfo, and naming the
+//!   parsed host verbatim;
+//! * `IsEmail` must respect the RFC 5321 length limits and dot rules;
+//! * the numeric validators must never accept a NaN or an infinity, read here
+//!   from the input's leading bytes;
 //! * `IsAlpha`, `IsAlphanumeric` and `IsNumeric` must agree with Rust's own
 //!   character classification, and must not disagree with each other;
 //! * `MinLength` and `MaxLength` must bound `char`s rather than bytes, which
@@ -25,11 +30,28 @@
 #![no_main]
 
 use armature_validation::{
-    IsAlpha, IsAlphanumeric, IsEmail, IsNumeric, IsUrl, IsUuid, MaxLength, MinLength, NotEmpty,
+    InRange, IsAlpha, IsAlphanumeric, IsEmail, IsNumeric, IsPositive, IsUrl, IsUuid, Max,
+    MaxLength, Min, MinLength, NotEmpty,
 };
 use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
+    // Every bit pattern is a float, NaNs and infinities included; none of the
+    // bounds may let a non-finite one through.
+    if let Some(bytes) = data.get(..8) {
+        let x = f64::from_le_bytes(bytes.try_into().unwrap());
+        let accepted = [
+            Min(f64::MIN).validate(x, "n").is_ok(),
+            Max(f64::MAX).validate(x, "n").is_ok(),
+            InRange { min: f64::MIN, max: f64::MAX }.validate(x, "n").is_ok(),
+            IsPositive::validate(x, "n").is_ok(),
+        ];
+        assert!(
+            x.is_finite() || !accepted.contains(&true),
+            "a numeric validator accepted non-finite {x}: {accepted:?}",
+        );
+    }
+
     let Ok(value) = std::str::from_utf8(data) else {
         return;
     };
@@ -71,10 +93,29 @@ fuzz_target!(|data: &[u8]| {
         // Re-parsed here rather than compared against a hand-rolled split:
         // matching `://` textually is not what the parser does, and asserting
         // it would report the difference between the two as a validator bug.
-        let scheme = url::Url::parse(value).ok().map(|u| u.scheme().to_owned());
+        let parsed = url::Url::parse(value).ok();
+        let scheme = parsed.as_ref().map(|u| u.scheme().to_owned());
         assert!(
             matches!(scheme.as_deref(), Some("http") | Some("https")),
             "IsUrl accepted {value:?}, whose parsed scheme is {scheme:?}",
+        );
+        let parsed = parsed.unwrap();
+        // The parser rewrites non-ASCII text, spaces and backslashes, and a
+        // userinfo makes people read the wrong host, so none may survive.
+        assert!(
+            value.is_ascii() && !value.contains([' ', '\\']),
+            "IsUrl accepted {value:?}, which the parser would rewrite",
+        );
+        assert!(
+            parsed.username().is_empty() && parsed.password().is_none(),
+            "IsUrl accepted {value:?}, which carries userinfo",
+        );
+        // The host the parser settled on must be the one written, so a
+        // percent-escaped, IDNA-mapped or shorthand host cannot pass.
+        let host = parsed.host_str().unwrap_or_default().to_ascii_lowercase();
+        assert!(
+            value.to_ascii_lowercase().contains(&format!("//{host}")),
+            "IsUrl accepted {value:?}, whose parsed host {host:?} is not written in it",
         );
     }
 
@@ -102,8 +143,19 @@ fuzz_target!(|data: &[u8]| {
 
     // An email must at least be non-empty; the regex is the definition of the
     // rest, so asserting a second pattern here would only restate it.
+    // RFC 5321 limits and the dot-atom shape of the local part.
     if is_email {
-        assert!(!value.is_empty(), "IsEmail accepted the empty string");
+        let (local, _) = value
+            .rsplit_once('@')
+            .unwrap_or_else(|| panic!("IsEmail accepted {value:?}, which has no `@`"));
+        assert!(
+            value.len() <= 254 && !local.is_empty() && local.len() <= 64,
+            "IsEmail accepted {value:?}, which exceeds the RFC 5321 limits",
+        );
+        assert!(
+            !local.starts_with('.') && !local.ends_with('.') && !local.contains(".."),
+            "IsEmail accepted {value:?}, whose local part has a stray dot",
+        );
     }
 
     // `NotEmpty` is documented as rejecting input that is empty or whitespace

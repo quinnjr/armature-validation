@@ -8,24 +8,33 @@ use serde::de::DeserializeOwned;
 pub struct ValidationPipe;
 
 impl ValidationPipe {
-    /// Validate and parse request body
+    /// Validate and parse request body.
+    ///
+    /// Both failure paths produce a 400 whose client-facing text carries no
+    /// submitted value:
+    ///
+    /// - a body that does not deserialize maps to [`Error::Deserialization`],
+    ///   which `armature-core` replaces with a generic message for the client.
+    ///   serde's own text quotes the offending input and names fields and enum
+    ///   variants of the target type, so it must not be passed through;
+    /// - a body that fails validation maps to [`Error::Validation`] with
+    ///   [`ValidationErrors::client_message`], i.e. `field: message` pairs only.
     pub fn parse<T>(req: &HttpRequest) -> Result<T, Error>
     where
         T: DeserializeOwned + Validate,
     {
-        // Parse JSON
-        let parsed: T = serde_json::from_slice(&req.body)
-            .map_err(|e| Error::BadRequest(format!("Invalid JSON: {}", e)))?;
+        let parsed: T =
+            serde_json::from_slice(&req.body).map_err(|e| Error::Deserialization(e.to_string()))?;
 
-        // Validate
-        parsed
-            .validate()
-            .map_err(|errors| Error::BadRequest(format!("Validation failed: {:?}", errors)))?;
+        parsed.validate().map_err(validation_error)?;
 
         Ok(parsed)
     }
 
-    /// Transform validation errors to HTTP response
+    /// Transform validation errors to an HTTP 400 response.
+    ///
+    /// The body is [`ValidationErrors::to_json`], which never includes the
+    /// submitted values.
     pub fn error_response(errors: ValidationErrors) -> HttpResponse {
         HttpResponse::from_parts(
             400,
@@ -38,13 +47,44 @@ impl ValidationPipe {
     }
 }
 
-/// Macro to validate a DTO in a handler
+/// The client-safe `Error` for a failed validation; shared with [`validate!`].
+#[doc(hidden)]
+pub fn validation_error(errors: Vec<crate::ValidationError>) -> Error {
+    Error::Validation(ValidationErrors::from(errors).client_message())
+}
+
+/// Validate a DTO in a handler, returning early with a 400 on failure.
+///
+/// Expands to a `?` on the DTO's [`Validate::validate`], so it must be used in
+/// a function returning `Result<_, armature_core::Error>`. The error carries
+/// `field: message` pairs only, never the submitted values.
+///
+/// ```
+/// use armature_validation::{validate, Validate, ValidationError};
+///
+/// struct Dto { name: String }
+///
+/// impl Validate for Dto {
+///     fn validate(&self) -> Result<(), Vec<ValidationError>> {
+///         if self.name.is_empty() {
+///             Err(vec![ValidationError::new("name", "name is required")])
+///         } else {
+///             Ok(())
+///         }
+///     }
+/// }
+///
+/// fn handler(dto: Dto) -> Result<(), armature_core::Error> {
+///     validate!(dto);
+///     Ok(())
+/// }
+///
+/// assert!(handler(Dto { name: "x".into() }).is_ok());
+/// assert!(handler(Dto { name: String::new() }).is_err());
+/// ```
 #[macro_export]
 macro_rules! validate {
-    ($dto:expr) => {{
-        $dto.validate()
-            .map_err(|errors| armature_core::Error::BadRequest(format!("{:?}", errors)))?
-    }};
+    ($dto:expr) => {{ $crate::Validate::validate(&$dto).map_err($crate::validation_error)? }};
 }
 
 #[cfg(test)]
@@ -92,5 +132,75 @@ mod tests {
 
         let result: Result<TestDto, Error> = ValidationPipe::parse(&req);
         assert!(result.is_ok());
+    }
+
+    fn request(body: &str) -> HttpRequest {
+        let mut req = HttpRequest::new("POST", "/test".to_string());
+        req.body = armature_core::Bytes::from(body.to_owned());
+        req
+    }
+
+    /// A rejected value must not come back to the client, even when the
+    /// validator attached it to the error.
+    #[test]
+    fn validation_failure_does_not_echo_submitted_values() {
+        #[derive(Debug, Deserialize)]
+        struct Login {
+            password: String,
+        }
+        impl Validate for Login {
+            fn validate(&self) -> Result<(), Vec<ValidationError>> {
+                Err(vec![
+                    ValidationError::new("password", "password is too short")
+                        .with_value(self.password.clone()),
+                ])
+            }
+        }
+
+        let err = ValidationPipe::parse::<Login>(&request(r#"{"password":"hunter2"}"#))
+            .expect_err("validation must fail");
+        assert!(matches!(err, Error::Validation(_)));
+        let client = err.client_message();
+        assert!(!client.contains("hunter2"), "{client}");
+        assert!(client.contains("password is too short"), "{client}");
+    }
+
+    /// serde's error text quotes the input and names the target type's fields;
+    /// the pipe must hand it to `Error::Deserialization`, which core redacts.
+    #[test]
+    fn invalid_json_is_redacted_for_the_client() {
+        let err = ValidationPipe::parse::<TestDto>(&request(r#"{"name":"x","age":"SECRET-123"}"#))
+            .expect_err("type mismatch must fail");
+        assert!(matches!(err, Error::Deserialization(_)));
+        let client = err.client_message();
+        assert!(!client.contains("SECRET-123"), "{client}");
+        assert!(!client.contains("age"), "{client}");
+    }
+
+    #[test]
+    fn error_response_omits_values() {
+        let errors = ValidationErrors::new(vec![
+            ValidationError::new("password", "too short").with_value("hunter2"),
+        ]);
+        let response = ValidationPipe::error_response(errors);
+        assert_eq!(response.status, 400);
+        let body = String::from_utf8(response.body.to_vec()).unwrap();
+        assert!(!body.contains("hunter2"), "{body}");
+        assert!(body.contains("too short"), "{body}");
+    }
+
+    #[test]
+    fn validate_macro_returns_client_safe_error() {
+        fn handler(dto: TestDto) -> Result<TestDto, Error> {
+            validate!(dto);
+            Ok(dto)
+        }
+        let err = handler(TestDto {
+            name: String::new(),
+            age: 1,
+        })
+        .expect_err("empty name must fail");
+        assert!(matches!(err, Error::Validation(_)));
+        assert!(err.client_message().contains("Name is required"));
     }
 }
