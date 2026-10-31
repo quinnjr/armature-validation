@@ -117,8 +117,9 @@ dependency features this crate used to enable for its consumers are gone.
   errors, so the derive's `regex` rule, which builds a `Matches` on every
   `validate()` call, no longer recompiles per request. The cache is bounded at
   512 entries and a 256 MiB weight budget: each entry is weighed by the
-  256 KiB / 1 / 2 / 4 MiB class its program fits (10 MiB beyond that) plus three times
-  its source length, so 64–128 typical Unicode rules such as `[\w.-]{3,32}` fit.
+  256 KiB / 1 / 2 / 4 MiB class its program fits (10 MiB beyond that) plus
+  three times its source length, so 64–128 typical Unicode rules such as
+  `[\w.-]{3,32}` fit.
   Weights are approximate (up to ~1.25x for unanchored patterns), and
   resident memory for a full cache measures about 350 MiB. Eviction is CLOCK;
   sources over 64 KiB are not cached. Concurrent misses on one pattern compile
