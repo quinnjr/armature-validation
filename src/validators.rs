@@ -662,9 +662,14 @@ impl<T: Numeric> InRange<T> {
 /// through the unreferenced slots. A working set cycled in order and larger
 /// than the cache misses on every call, as with any CLOCK or LRU cache.
 ///
-/// A source longer than [`MAX_PATTERN`] is never cached.
+/// The source itself is counted in an entry's weight, and a source longer
+/// than [`MAX_PATTERN`] is never cached (it is compiled once per call, with
+/// no size-class probing).
+///
+/// The budget bounds the weights, not the heap: measured resident memory for
+/// a cache filled with 2–4 MiB-class patterns plateaus at about 350 MiB.
 static MATCHES_CACHE: LazyLock<RwLock<PatternCache>> = LazyLock::new(Default::default);
-const MAX_PATTERN: usize = 1024;
+const MAX_PATTERN: usize = 64 * 1024;
 const CACHE_ENTRIES: usize = 512;
 const CACHE_BUDGET: usize = 256 * 1024 * 1024;
 const SIZE_CLASSES: [usize; 4] = [256 * 1024, 1024 * 1024, 2 * 1024 * 1024, 4 * 1024 * 1024];
@@ -828,7 +833,7 @@ impl Matches {
             return compiled.map(Self);
         }
         if pattern.len() > MAX_PATTERN {
-            return Self::compile(full, pattern).0.map(Self);
+            return Regex::new(&Self::source(full, pattern)?).map(Self);
         }
         // The `Leader` is built while the map is locked, so no code runs
         // between registering the slot and owning its cleanup.
@@ -860,13 +865,26 @@ impl Matches {
                 MATCHES_CACHE
                     .write()
                     .unwrap_or_else(|e| e.into_inner())
-                    .insert(key, compiled.clone(), weight);
+                    .insert(key, compiled.clone(), weight + pattern.len());
                 compiled
             }
         };
         let _ = leader.slot.set(compiled.clone());
         drop(leader);
         compiled.map(Self)
+    }
+
+    /// The regex source for `pattern`: itself, or for `full` the anchored
+    /// form, after checking the bare pattern parses. Parsing is enough to
+    /// reject an unbalanced pattern, and far cheaper than compiling it.
+    fn source(full: bool, pattern: &str) -> Result<String, regex::Error> {
+        if !full {
+            return Ok(pattern.to_owned());
+        }
+        regex_syntax::Parser::new()
+            .parse(pattern)
+            .map_err(|e| regex::Error::Syntax(e.to_string()))?;
+        Ok(format!(r"\A(?:{pattern})\z"))
     }
 
     /// Compile without the cache, returning the result and its cache weight.
@@ -884,15 +902,9 @@ impl Matches {
                 .entry((full, pattern.to_owned()))
                 .or_default() += 1;
         }
-        let source = if full {
-            // Parsing is enough to reject an unbalanced pattern, and far
-            // cheaper than compiling it.
-            if let Err(e) = regex_syntax::Parser::new().parse(pattern) {
-                return (Err(regex::Error::Syntax(e.to_string())), ERROR_WEIGHT);
-            }
-            format!(r"\A(?:{pattern})\z")
-        } else {
-            pattern.to_owned()
+        let source = match Self::source(full, pattern) {
+            Ok(source) => source,
+            Err(e) => return (Err(e), ERROR_WEIGHT),
         };
         for limit in SIZE_CLASSES {
             match regex::RegexBuilder::new(&source).size_limit(limit).build() {
@@ -1596,6 +1608,7 @@ mod tests {
         assert!(Matches::cached(false, pattern));
         assert!(a.validate("cache-me-42", "f").is_ok());
         let long = format!("^{}$", "x".repeat(MAX_PATTERN));
+        assert!(Matches::full(&long).is_ok());
         assert!(Matches::new(&long).is_ok());
         assert!(
             !Matches::cached(false, &long),

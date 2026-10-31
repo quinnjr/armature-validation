@@ -116,6 +116,11 @@ impl ValidationErrors {
     /// client's own input (possibly a password) and echoing it also lets one
     /// large rejected field inflate the response. Use
     /// [`to_json_with_values`](Self::to_json_with_values) to opt in.
+    ///
+    /// At most [`JSON_MAX_ERRORS`](Self::JSON_MAX_ERRORS) errors are listed;
+    /// when there are more, a `"truncated"` field gives the number left out,
+    /// so a body that fails one check per array element cannot produce a
+    /// response many times its own size.
     pub fn to_json(&self) -> serde_json::Value {
         self.json(false)
     }
@@ -130,8 +135,9 @@ impl ValidationErrors {
     }
 
     fn json(&self, with_values: bool) -> serde_json::Value {
-        serde_json::json!({
-            "errors": self.errors.iter().map(|e| {
+        let shown = self.errors.len().min(Self::JSON_MAX_ERRORS);
+        let mut json = serde_json::json!({
+            "errors": self.errors[..shown].iter().map(|e| {
                 let mut entry = serde_json::json!({
                     "field": e.field,
                     "message": e.message,
@@ -142,8 +148,15 @@ impl ValidationErrors {
                 }
                 entry
             }).collect::<Vec<_>>()
-        })
+        });
+        if self.errors.len() > shown {
+            json["truncated"] = (self.errors.len() - shown).into();
+        }
+        json
     }
+
+    /// The most errors [`to_json`](Self::to_json) lists.
+    pub const JSON_MAX_ERRORS: usize = 100;
 
     /// A one-line summary that is safe to send to a client: each error's
     /// message, prefixed with `field: ` unless the message already names the
@@ -305,6 +318,22 @@ mod tests {
         );
         let message = many.client_message();
         assert!(message.ends_with("f19: bad (and 80 more)"), "{message}");
+    }
+
+    #[test]
+    fn to_json_is_capped() {
+        let many = ValidationErrors::new(
+            (0..1000)
+                .map(|i| ValidationError::new(format!("f{i}"), "bad"))
+                .collect(),
+        );
+        let json = many.to_json();
+        assert_eq!(
+            json["errors"].as_array().unwrap().len(),
+            ValidationErrors::JSON_MAX_ERRORS
+        );
+        assert_eq!(json["truncated"], 900);
+        assert!(errors().to_json().get("truncated").is_none());
     }
 
     #[test]

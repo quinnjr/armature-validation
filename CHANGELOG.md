@@ -65,8 +65,9 @@ Earlier changes are recorded in the workspace [`CHANGELOG.md`](https://github.co
   panicking.
 - **`NotEmpty` rejects invisible-only values** (zero-width spaces, bidi
   controls, Hangul fillers, the braille blank, combining marks with nothing to
-  combine with in the common scripts, and similar), which displayed as blank while passing a
-  `trim()` check. Control-only values such as `"\0"` are rejected too.
+  combine with in the common scripts, and similar), which displayed as blank
+  while passing a `trim()` check. Control-only values such as `"\0"` are
+  rejected too.
 - **`IsEmail` enforces RFC 5321 lengths and dot-atom rules**: at most 64
   octets before the `@` and 254 in total, and no leading, trailing or
   consecutive dots in the local part.
@@ -95,6 +96,9 @@ Earlier changes are recorded in the workspace [`CHANGELOG.md`](https://github.co
   group early). `Matches` itself matches anywhere in the value, which is now
   documented.
 - `ValidationErrors::to_json_with_values` and `client_message`.
+- `ValidationErrors::to_json` lists at most 100 errors, adding a `truncated`
+  count of the rest, so a body failing one check per array element cannot
+  produce a response many times its size.
 - `IsNumeric` and `IsUuid` in the prelude.
 - `ValidationPipe::parse_strict`, which also requires a single JSON
   `Content-Type` (`application/json` or `application/<token>+json`; 415
@@ -106,10 +110,12 @@ Earlier changes are recorded in the workspace [`CHANGELOG.md`](https://github.co
 - `Matches::new` and `Matches::full` cache compiled patterns, and compile
   errors, so the derive's `regex` rule, which builds a `Matches` on every
   `validate()` call, no longer recompiles per request. The cache is bounded at
-  512 entries and about 256 MiB (up to ~1.25× for unanchored patterns) of compiled program (each entry weighed by
-  the 256 KiB / 1 / 2 / 4 MiB class it fits, or 10 MiB beyond that; 64–128
-  typical Unicode rules such as `[\w.-]{3,32}` fit), uses CLOCK eviction, and
-  never caches sources over 1 KiB. Concurrent misses on one pattern compile
+  512 entries and a 256 MiB weight budget: each entry is weighed by the
+  256 KiB / 1 / 2 / 4 MiB class its program fits (10 MiB beyond that) plus its
+  source length, so 64–128 typical Unicode rules such as `[\w.-]{3,32}` fit.
+  Weights are approximate (up to ~1.25x for unanchored patterns), and
+  resident memory for a full cache measures about 350 MiB. Eviction is CLOCK;
+  sources over 64 KiB are not cached. Concurrent misses on one pattern compile
   it once and share the result. An application cycling through more large
   patterns than fit recompiles on each call, as without a cache. Each use
   clones the cached `Regex`, which starts an empty search cache (microseconds
