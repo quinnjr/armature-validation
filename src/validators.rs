@@ -340,8 +340,17 @@ impl IsUrl {
         };
         let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
         let (authority, tail) = rest.split_at(authority_end);
-        // `[` and `]` are only for an IP-literal host (RFC 3986 §3.2.2).
-        if authority.contains('@') || tail.contains(['[', ']']) {
+        // `[` and `]` belong to an IP-literal host (RFC 3986 §3.2.2), so not
+        // in the path or fragment. A query keeps them: `?page[size]=10` is
+        // JSON:API's and many frameworks' convention, and the parser leaves
+        // it as written.
+        let query_start = tail.find('?').unwrap_or(tail.len());
+        let fragment_start = tail.find('#').unwrap_or(tail.len());
+        let (path, fragment) = (
+            &tail[..query_start.min(fragment_start)],
+            &tail[fragment_start..],
+        );
+        if authority.contains('@') || path.contains(['[', ']']) || fragment.contains(['[', ']']) {
             return false;
         }
 
@@ -631,10 +640,11 @@ impl<T: Numeric> InRange<T> {
 /// `validate()`) is compiled once rather than on every request.
 ///
 /// Bounded by a byte budget, [`CACHE_BUDGET`], and an entry count,
-/// [`CACHE_ENTRIES`]. Each entry is weighed by the smallest of
-/// [`SIZE_CLASSES`] its compiled program fits under, an upper bound on its
-/// size; a pattern over the largest class is compiled under the `regex`
-/// crate's default limit and weighed at that. Unicode classes make large
+/// [`CACHE_ENTRIES`]. Each entry is weighed at 1.25 × the smallest of
+/// [`SIZE_CLASSES`] its compiled program fits under: the class limits the
+/// NFAs, and the one-pass DFA and prefilters add up to about another tenth,
+/// so the budget is approximate. A pattern over the largest class is
+/// compiled under the `regex` crate's default limit and weighed at that. Unicode classes make large
 /// programs common: `^[\w.-]{3,32}$` compiles to about 2 MiB. Every entry's
 /// lazy-DFA cache (one per thread using it) is capped at [`CACHE_DFA`], so
 /// the worst case is about [`CACHE_BUDGET`] plus `threads × CACHE_ENTRIES ×
@@ -652,16 +662,15 @@ const MAX_PATTERN: usize = 1024;
 const CACHE_ENTRIES: usize = 512;
 const CACHE_BUDGET: usize = 256 * 1024 * 1024;
 const CACHE_DFA: usize = 256 * 1024;
-const SIZE_CLASSES: [usize; 6] = [
-    256 * 1024,
-    512 * 1024,
-    1024 * 1024,
-    2 * 1024 * 1024,
-    4 * 1024 * 1024,
-    8 * 1024 * 1024,
-];
+const SIZE_CLASSES: [usize; 3] = [256 * 1024, 2 * 1024 * 1024, 8 * 1024 * 1024];
 /// `regex`'s default `size_limit`, the weight of a pattern over every class.
 const DEFAULT_COMPILED: usize = 10 * 1024 * 1024;
+
+/// An entry's budget weight for a program within `limit`; see
+/// [`MATCHES_CACHE`].
+const fn weigh(limit: usize) -> usize {
+    limit + limit / 4
+}
 
 type PatternKey = (bool, String);
 
@@ -701,14 +710,21 @@ impl PatternCache {
             if entry.referenced.swap(false, AtomicOrdering::Relaxed) {
                 self.hand += 1;
             } else {
-                let victim = self.ring.swap_remove(self.hand);
+                // `remove`, not `swap_remove`: the ring's order is the
+                // CLOCK's, and swapping would bring the newest entry under
+                // the hand to be evicted next.
+                let victim = self.ring.remove(self.hand);
                 if let Some(old) = self.entries.remove(&victim) {
                     self.weight -= old.weight;
                 }
             }
         }
         self.weight += weight;
-        self.ring.push(key.clone());
+        // Behind the hand, so a new entry gets a full sweep before it is
+        // considered for eviction.
+        let at = self.hand.min(self.ring.len());
+        self.ring.insert(at, key.clone());
+        self.hand = at + 1;
         self.entries.insert(
             key,
             CacheEntry {
@@ -779,9 +795,11 @@ impl Matches {
         if pattern.len() > MAX_PATTERN {
             return Ok(Self(Regex::new(&source)?));
         }
-        // The smallest size class the program fits is its cache weight. A
-        // failed attempt stops as soon as it exceeds its limit, so on a miss
-        // the extra attempts cost about as much as the final compile.
+        // The smallest size class the program fits sets its cache weight. A
+        // failed attempt stops once it exceeds its limit, but still costs up
+        // to that limit's worth of compiling: with three classes a miss on a
+        // large pattern costs about twice to two and a half times a plain
+        // compile.
         let mut compiled = None;
         for limit in SIZE_CLASSES {
             match regex::RegexBuilder::new(&source)
@@ -790,7 +808,7 @@ impl Matches {
                 .build()
             {
                 Ok(regex) => {
-                    compiled = Some((regex, limit));
+                    compiled = Some((regex, weigh(limit)));
                     break;
                 }
                 Err(regex::Error::CompiledTooBig(_)) => continue,
@@ -803,7 +821,7 @@ impl Matches {
                 regex::RegexBuilder::new(&source)
                     .dfa_size_limit(CACHE_DFA)
                     .build()?,
-                DEFAULT_COMPILED,
+                weigh(DEFAULT_COMPILED),
             ),
         };
         MATCHES_CACHE
@@ -1271,7 +1289,6 @@ mod tests {
             "https://example.com//evil.example/x",
             "https://example.com/#a#b",
             "https://example.com/[x]",
-            "https://example.com/?[x]",
             "https://example.com/#[x]",
             // Malformed percent-escapes.
             "https://example.com/%zz",
@@ -1322,6 +1339,7 @@ mod tests {
             "https://example.com#frag",
             "https://example.com:8443?x",
             "https://example.com/%2F",
+            "https://api.example/items?page[size]=10&filter[name]=x",
         ] {
             assert!(
                 IsUrl::validate(value, "url").is_ok(),
@@ -1364,12 +1382,43 @@ mod tests {
         }
         assert_eq!(cache.entries.len(), CACHE_ENTRIES);
         for i in 0..100 {
-            cache.insert((false, format!("l{i}")), regex.clone(), DEFAULT_COMPILED);
+            cache.insert(
+                (false, format!("l{i}")),
+                regex.clone(),
+                weigh(DEFAULT_COMPILED),
+            );
         }
         assert!(cache.weight <= CACHE_BUDGET, "weight {}", cache.weight);
         let summed: usize = cache.entries.values().map(|e| e.weight).sum();
         assert_eq!(summed, cache.weight);
         assert_eq!(cache.ring.len(), cache.entries.len());
+    }
+
+    /// A pattern first inserted while the cache is full and churning must
+    /// survive until its next use: new entries go behind the CLOCK hand.
+    #[test]
+    fn matches_cache_keeps_entries_inserted_during_churn() {
+        let regex = Regex::new("x").unwrap();
+        let mut cache = PatternCache::default();
+        for i in 0..CACHE_ENTRIES {
+            cache.insert((false, format!("fill{i}")), regex.clone(), SIZE_CLASSES[0]);
+        }
+        let late = (false, "late".to_string());
+        let mut misses = 0;
+        for round in 0..50 {
+            if cache.get(&late).is_none() {
+                misses += 1;
+                cache.insert(late.clone(), regex.clone(), SIZE_CLASSES[0]);
+            }
+            for k in 0..10 {
+                cache.insert(
+                    (false, format!("cold{round}-{k}")),
+                    regex.clone(),
+                    SIZE_CLASSES[0],
+                );
+            }
+        }
+        assert_eq!(misses, 1, "late entry was evicted before reuse");
     }
 
     /// A working set that fits survives a stream of one-off patterns: CLOCK

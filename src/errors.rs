@@ -153,7 +153,11 @@ impl ValidationErrors {
     /// At most [`CLIENT_MESSAGE_MAX_ERRORS`](Self::CLIENT_MESSAGE_MAX_ERRORS)
     /// errors are listed, followed by a count of the rest, so a body that
     /// fails thousands of nested checks does not produce a message of the
-    /// same size.
+    /// same size; each error's text is cut at
+    /// [`CLIENT_MESSAGE_MAX_CHARS`](Self::CLIENT_MESSAGE_MAX_CHARS) characters
+    /// and marked with `…`. Control characters, line and paragraph separators
+    /// and bidi formatting characters are replaced with spaces, so a
+    /// caller-written field or message stays on one line and reads in order.
     pub fn client_message(&self) -> String {
         let shown = self.errors.len().min(Self::CLIENT_MESSAGE_MAX_ERRORS);
         let mut message = self.errors[..shown]

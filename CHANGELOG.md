@@ -48,13 +48,16 @@ Earlier changes are recorded in the workspace [`CHANGELOG.md`](https://github.co
   the parser left unchanged; port 0 and a path beginning with `//` (a
   protocol-relative open redirect when the path is used on its own) are also
   rejected, as are a second `#` (RFC 3986 allows none inside a fragment) and
-  `[`/`]` outside an IP-literal host.
+  `[`/`]` in the path or fragment (they remain allowed in the query, as in
+  `?page[size]=10`).
   Documented as a syntax check, not an SSRF filter.
   Previously-accepted inputs that are now **rejected** (breaking): non-ASCII
   hosts or paths (give hosts in `xn--` form and percent-encode paths);
   characters the parser encodes, such as `'` in a query or `` ` ``, `{`, `|`,
   `^`; non-canonical IPv6 (`[0:0::1]`, `[::ffff:127.0.0.1]`); ports with
-  leading zeros (`:0443`); dot segments (`/a/../b`); malformed `%` escapes.
+  leading zeros (`:0443`); dot segments (`/a/../b`); malformed `%` escapes;
+  `[`/`]` in a path or fragment; a second `#`; a path starting with `//`;
+  port 0; userinfo.
 - **`validate_parallel` no longer copies a validator's panic message into the
   returned error.** A panicking validator now fails its own field closed
   (`validationFailed`) without discarding other fields' errors, and the call
@@ -101,8 +104,8 @@ Earlier changes are recorded in the workspace [`CHANGELOG.md`](https://github.co
 ### Changed
 
 - `Matches::new` and `Matches::full` cache compiled patterns, bounded at 512
-  entries and 256 MiB of compiled program (each entry weighed by the
-  power-of-two size class it fits, so Unicode patterns such as
+  entries and approximately 256 MiB of compiled program (each entry weighed
+  by the size class it fits, so Unicode patterns such as
   `[\w.-]{3,32}`, about 2 MiB, are cached too), with lazy-DFA caches capped
   at 256 KiB per thread and CLOCK eviction that keeps recently used patterns;
   sources over 1 KiB are not cached, so the derive's `regex`
