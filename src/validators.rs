@@ -9,10 +9,10 @@
 use crate::ValidationError;
 use regex::Regex;
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
-use std::sync::{LazyLock, RwLock};
+use std::sync::{Condvar, LazyLock, Mutex, RwLock};
 
 /// RFC 5322 `dot-atom` local part, `@`, then a hostname.
 ///
@@ -237,9 +237,11 @@ impl IsUrl {
     /// accepted only if:
     ///
     /// - it consists solely of RFC 3986 URI characters (ASCII letters, digits,
-    ///   `-._~:/?#[]@!$&'()*+,;=` and `%`-escapes). Anything else, from a CR
-    ///   or a space to a backslash, a zero-width space or a fullwidth letter,
-    ///   is something the WHATWG parser strips, rewrites or percent-encodes;
+    ///   `-._~:/?#[]@!$&'()*+,;=` and well-formed `%`-escapes), with `[`/`]`
+    ///   only in an IP-literal host or the query and at most one `#`.
+    ///   Anything else, from a CR or a space to a backslash, a zero-width
+    ///   space or a fullwidth letter, is something the WHATWG parser strips,
+    ///   rewrites or percent-encodes;
     /// - it begins with `http://` or `https://` literally (case-insensitive).
     ///   The parser also accepts `https:host`, `https:/host` and
     ///   `https:\\host`, which other consumers read differently;
@@ -666,6 +668,38 @@ const SIZE_CLASSES: [usize; 3] = [256 * 1024, 2 * 1024 * 1024, 8 * 1024 * 1024];
 /// `regex`'s default `size_limit`, the weight of a pattern over every class.
 const DEFAULT_COMPILED: usize = 10 * 1024 * 1024;
 
+/// Patterns being compiled for the cache. A caller that misses on a pattern
+/// already here waits on [`MATCHES_INFLIGHT_DONE`] and then finds it cached.
+static MATCHES_INFLIGHT: LazyLock<Mutex<HashSet<PatternKey>>> = LazyLock::new(Default::default);
+static MATCHES_INFLIGHT_DONE: Condvar = Condvar::new();
+
+/// Marks a pattern as being compiled; dropping it, on any path, unmarks it
+/// and wakes waiters.
+struct InFlight(PatternKey);
+
+impl InFlight {
+    fn enter(key: &PatternKey) -> Self {
+        let mut inflight = MATCHES_INFLIGHT.lock().unwrap_or_else(|e| e.into_inner());
+        while inflight.contains(key) {
+            inflight = MATCHES_INFLIGHT_DONE
+                .wait(inflight)
+                .unwrap_or_else(|e| e.into_inner());
+        }
+        inflight.insert(key.clone());
+        Self(key.clone())
+    }
+}
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        MATCHES_INFLIGHT
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.0);
+        MATCHES_INFLIGHT_DONE.notify_all();
+    }
+}
+
 /// An entry's budget weight for a program within `limit`; see
 /// [`MATCHES_CACHE`].
 const fn weigh(limit: usize) -> usize {
@@ -775,6 +809,16 @@ impl Matches {
     /// which checked the bare pattern before inserting it.
     fn cached_compile(full: bool, pattern: &str) -> Result<Self, regex::Error> {
         let key = (full, pattern.to_owned());
+        if let Some(regex) = MATCHES_CACHE
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&key)
+        {
+            return Ok(Self(regex));
+        }
+        // Single flight: concurrent misses on one pattern wait for the first
+        // compile instead of each repeating it.
+        let _flight = (pattern.len() <= MAX_PATTERN).then(|| InFlight::enter(&key));
         if let Some(regex) = MATCHES_CACHE
             .read()
             .unwrap_or_else(|e| e.into_inner())
@@ -1419,6 +1463,22 @@ mod tests {
             }
         }
         assert_eq!(misses, 1, "late entry was evicted before reuse");
+    }
+
+    /// Concurrent misses on one pattern compile it once: the rest wait for
+    /// the first and are served from the cache.
+    #[test]
+    fn matches_cache_single_flight() {
+        let pattern = r"^single-flight-[\w.-]{3,32}$";
+        let threads: Vec<_> = (0..8)
+            .map(|_| std::thread::spawn(move || Matches::new(pattern).unwrap()))
+            .collect();
+        for t in threads {
+            assert!(t.join().unwrap().validate("single-flight-abc", "f").is_ok());
+        }
+        assert!(Matches::cached(false, pattern));
+        let key = (false, pattern.to_owned());
+        assert!(!MATCHES_INFLIGHT.lock().unwrap().contains(&key));
     }
 
     /// A working set that fits survives a stream of one-off patterns: CLOCK

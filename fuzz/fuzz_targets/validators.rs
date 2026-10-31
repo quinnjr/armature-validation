@@ -19,7 +19,9 @@
 //! * the numeric validators must never accept a NaN or an infinity, read here
 //!   from the input's leading bytes as both an `f64` and an `f32`;
 //! * `Matches::full` must anchor to the whole value;
-//! * `ValidationPipe::parse_strict` must not panic on any `Content-Type`;
+//! * `ValidationPipe::parse_strict` must not panic on any `Content-Type`
+//!   bytes, must refuse a repeated header, and must accept exactly the JSON
+//!   media types;
 //! * `IsAlpha`, `IsAlphanumeric` and `IsNumeric` must agree with Rust's own
 //!   character classification, and must not disagree with each other;
 //! * `MinLength` and `MaxLength` must bound `char`s rather than bytes, which
@@ -162,8 +164,9 @@ fuzz_target!(|data: &[u8]| {
         );
     }
 
-    // `parse_strict` reads a client-supplied header: arbitrary text there must
-    // be a 415 or a parse result, never a panic.
+    // `parse_strict` reads a client-supplied header: arbitrary bytes there
+    // must be a 415 or a parse result, never a panic, and the verdict must
+    // match an independent statement of "a single JSON media type".
     {
         struct Dto;
         impl<'de> serde::Deserialize<'de> for Dto {
@@ -176,30 +179,20 @@ fuzz_target!(|data: &[u8]| {
                 Ok(())
             }
         }
+        // A newline splits the input into two header lines, as a client
+        // sending the field twice would.
+        let lines: Vec<&[u8]> = data.splitn(2, |&b| b == b'\n').collect();
         let mut req = armature_core::HttpRequest::new("POST", "/".to_string());
-        req.headers.insert("content-type", value);
+        for line in &lines {
+            req.headers.append("content-type", *line);
+        }
         req.body = armature_core::Bytes::from_static(b"{}");
         let accepted = armature_validation::ValidationPipe::parse_strict::<Dto>(&req).is_ok();
-        // Accepted means a JSON media type, stated without the validator's
-        // byte-level parsing: ASCII, `application/` then a subtype ending in
-        // `json` (`json` itself or `…+json`), no spaces inside.
-        if accepted {
-            let media = value
-                .split(';')
-                .next()
-                .unwrap_or("")
-                .trim_matches([' ', '\t']);
-            let lower = media.to_ascii_lowercase();
-            let sub = lower.strip_prefix("application/").unwrap_or_else(|| {
-                panic!("parse_strict accepted Content-Type {value:?}, not application/*")
-            });
-            assert!(
-                media.is_ascii()
-                    && !sub.contains([' ', '\t', '/', '"'])
-                    && (sub == "json" || (sub.len() > 5 && sub.ends_with("+json"))),
-                "parse_strict accepted Content-Type {value:?}",
-            );
-        }
+        let expected = lines.len() == 1 && is_json_media_type(lines[0]);
+        assert_eq!(
+            accepted, expected,
+            "parse_strict on Content-Type {lines:?}: accepted {accepted}, expected {expected}",
+        );
     }
 
     // `Matches::full` anchors to the whole value: the escaped value matches
@@ -312,4 +305,31 @@ fn canonical_url(value: &str) -> String {
         format!("/{tail}")
     };
     format!("{scheme}://{authority}{tail}")
+}
+
+/// RFC 9110 `media-type` naming JSON: `application/json` or
+/// `application/<token>+json`, ignoring parameters and surrounding SP/HTAB.
+/// Written with `str` operations rather than the validator's byte loops.
+fn is_json_media_type(value: &[u8]) -> bool {
+    let Ok(text) = std::str::from_utf8(value) else {
+        // Non-UTF-8 bytes in the parameters are allowed; the media type
+        // itself must be ASCII, which the token check below enforces.
+        let media = value.split(|&b| b == b';').next().unwrap_or_default();
+        return std::str::from_utf8(media).is_ok_and(|m| is_json_media_type(m.as_bytes()));
+    };
+    let media = text
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim_matches([' ', '\t']);
+    let lower = media.to_ascii_lowercase();
+    let Some(sub) = lower.strip_prefix("application/") else {
+        return false;
+    };
+    let token = |s: &str| {
+        !s.is_empty()
+            && s.chars()
+                .all(|c| c.is_ascii_alphanumeric() || "!#$%&'*+-.^_`|~".contains(c))
+    };
+    token(sub) && (sub == "json" || sub.strip_suffix("+json").is_some_and(|p| !p.is_empty()))
 }
