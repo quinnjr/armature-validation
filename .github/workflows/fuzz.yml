@@ -8,6 +8,11 @@ on:
 permissions:
   contents: read
 
+# A new push to the same PR supersedes the run in progress.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -15,17 +20,18 @@ jobs:
   fuzz:
     name: fuzz ${{ matrix.target }}
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
         target: [validators]
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
       # cargo-fuzz needs nightly: the sanitizer and coverage instrumentation
       # libFuzzer relies on are nightly-only. `clippy` is requested explicitly
       # because this action installs the minimal profile, which omits it.
-        with:
-          persist-credentials: false
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           components: clippy
@@ -33,13 +39,32 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           workspaces: fuzz
-      - run: cargo install cargo-fuzz --locked
+      # Keep the corpus between runs: 60 seconds from an empty corpus every
+      # time never gets past the shallow inputs. Restored from the newest
+      # entry; saved (minimised) only from pushes to the long-lived branches,
+      # so PR runs do not each add an entry to the repository's cache quota.
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: fuzz/corpus/${{ matrix.target }}
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
+          restore-keys: fuzz-corpus-${{ matrix.target }}-
+      # Pinned like the actions above: an unpinned install runs whatever was
+      # published most recently, with this job's checkout in reach.
+      - run: cargo install cargo-fuzz --locked --version 0.13.2
       # `fuzz/` is its own workspace, so the crate's own clippy run never sees
       # it. Without this the harnesses are the one part of the tree outside the
       # lint gate.
       - run: cargo clippy --manifest-path fuzz/Cargo.toml --all-targets -- -D warnings
       - name: Fuzz ${{ matrix.target }} for 60s
         run: cargo fuzz run ${{ matrix.target }} -- -max_total_time=60 -print_final_stats=1
+      - name: Minimise corpus
+        if: github.event_name == 'push'
+        run: cargo fuzz cmin ${{ matrix.target }}
+      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        if: github.event_name == 'push'
+        with:
+          path: fuzz/corpus/${{ matrix.target }}
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
       # The crash file is the reproducer. Without it the log line naming the
       # input is all that survives the runner, and re-finding it costs a run.
       - name: Upload crash artifacts

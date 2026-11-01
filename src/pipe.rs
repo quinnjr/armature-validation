@@ -8,24 +8,69 @@ use serde::de::DeserializeOwned;
 pub struct ValidationPipe;
 
 impl ValidationPipe {
-    /// Validate and parse request body
+    /// Validate and parse request body.
+    ///
+    /// Both failure paths produce a 400 whose client-facing text carries no
+    /// submitted value:
+    ///
+    /// - a body that does not deserialize maps to [`Error::Deserialization`],
+    ///   which `armature-core` replaces with a generic message for the client.
+    ///   The error carries only serde's error category and position, not its
+    ///   message: that quotes the offending input and names fields and enum
+    ///   variants of the target type, and core logs the detail;
+    /// - a body that fails validation maps to [`Error::Validation`] with
+    ///   [`ValidationErrors::client_message`], i.e. `field: message` pairs only.
     pub fn parse<T>(req: &HttpRequest) -> Result<T, Error>
     where
         T: DeserializeOwned + Validate,
     {
-        // Parse JSON
-        let parsed: T = serde_json::from_slice(&req.body)
-            .map_err(|e| Error::BadRequest(format!("Invalid JSON: {}", e)))?;
+        let parsed: T =
+            // Only the error's category and position: serde's message quotes the
+            // offending input, and `armature-core` logs `Deserialization` detail.
+            serde_json::from_slice(&req.body).map_err(|e| {
+                Error::Deserialization(format!(
+                    "{:?} error at line {} column {}",
+                    e.classify(),
+                    e.line(),
+                    e.column()
+                ))
+            })?;
 
-        // Validate
-        parsed
-            .validate()
-            .map_err(|errors| Error::BadRequest(format!("Validation failed: {:?}", errors)))?;
+        parsed.validate().map_err(validation_error)?;
 
         Ok(parsed)
     }
 
-    /// Transform validation errors to HTTP response
+    /// Like [`parse`](Self::parse), but first requires a JSON `Content-Type`
+    /// (`application/json` or any `application/*+json`), failing with
+    /// [`Error::UnsupportedMediaType`] (415) otherwise.
+    ///
+    /// `parse` reads any body as JSON. A cross-site HTML form can send a JSON
+    /// body as `text/plain` without a CORS preflight, so an endpoint that
+    /// authenticates by cookie and uses `parse` accepts forged requests. Use
+    /// this method for such endpoints.
+    pub fn parse_strict<T>(req: &HttpRequest) -> Result<T, Error>
+    where
+        T: DeserializeOwned + Validate,
+    {
+        // A duplicated header is refused rather than resolved: which copy
+        // wins depends on who appended it.
+        let is_json = matches!(
+            req.headers.get_unique("content-type"),
+            Ok(Some(value)) if is_json_media_type(value)
+        );
+        if !is_json {
+            return Err(Error::UnsupportedMediaType(
+                "expected a JSON Content-Type".to_string(),
+            ));
+        }
+        Self::parse(req)
+    }
+
+    /// Transform validation errors to an HTTP 400 response.
+    ///
+    /// The body is [`ValidationErrors::to_json`], which never includes the
+    /// submitted values.
     pub fn error_response(errors: ValidationErrors) -> HttpResponse {
         HttpResponse::from_parts(
             400,
@@ -38,13 +83,72 @@ impl ValidationPipe {
     }
 }
 
-/// Macro to validate a DTO in a handler
+/// Whether a `Content-Type` value names `application/json` or an
+/// `application/*+json` type.
+///
+/// Works on bytes, since the header is client input and need not be ASCII.
+/// Only HTTP whitespace (SP, HTAB) is trimmed, and the subtype must be an
+/// RFC 9110 token, so lookalikes with Unicode spaces or quotes do not pass.
+fn is_json_media_type(value: &[u8]) -> bool {
+    fn is_tchar(b: &u8) -> bool {
+        b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(b)
+    }
+    let media = value.split(|&b| b == b';').next().unwrap_or_default();
+    let start = media.iter().position(|b| !matches!(b, b' ' | b'\t'));
+    let end = media.iter().rposition(|b| !matches!(b, b' ' | b'\t'));
+    let (Some(start), Some(end)) = (start, end) else {
+        return false;
+    };
+    let media = &media[start..=end];
+    let Some(slash) = media.iter().position(|&b| b == b'/') else {
+        return false;
+    };
+    let (ty, sub) = (&media[..slash], &media[slash + 1..]);
+    ty.eq_ignore_ascii_case(b"application")
+        && !sub.is_empty()
+        && sub.iter().all(is_tchar)
+        && (sub.eq_ignore_ascii_case(b"json")
+            || (sub.len() > 5 && sub[sub.len() - 5..].eq_ignore_ascii_case(b"+json")))
+}
+
+/// The client-safe `Error` for a failed validation; shared with [`validate!`].
+#[doc(hidden)]
+pub fn validation_error(errors: Vec<crate::ValidationError>) -> Error {
+    Error::Validation(ValidationErrors::from(errors).client_message())
+}
+
+/// Validate a DTO in a handler, returning early with a 400 on failure.
+///
+/// Expands to a `?` on the DTO's [`Validate::validate`], so it must be used in
+/// a function returning `Result<_, armature_core::Error>`. The error carries
+/// `field: message` pairs only, never the submitted values.
+///
+/// ```
+/// use armature_validation::{validate, Validate, ValidationError};
+///
+/// struct Dto { name: String }
+///
+/// impl Validate for Dto {
+///     fn validate(&self) -> Result<(), Vec<ValidationError>> {
+///         if self.name.is_empty() {
+///             Err(vec![ValidationError::new("name", "name is required")])
+///         } else {
+///             Ok(())
+///         }
+///     }
+/// }
+///
+/// fn handler(dto: Dto) -> Result<(), armature_core::Error> {
+///     validate!(dto);
+///     Ok(())
+/// }
+///
+/// assert!(handler(Dto { name: "x".into() }).is_ok());
+/// assert!(handler(Dto { name: String::new() }).is_err());
+/// ```
 #[macro_export]
 macro_rules! validate {
-    ($dto:expr) => {{
-        $dto.validate()
-            .map_err(|errors| armature_core::Error::BadRequest(format!("{:?}", errors)))?
-    }};
+    ($dto:expr) => {{ $crate::Validate::validate(&$dto).map_err($crate::validation_error)? }};
 }
 
 #[cfg(test)]
@@ -92,5 +196,124 @@ mod tests {
 
         let result: Result<TestDto, Error> = ValidationPipe::parse(&req);
         assert!(result.is_ok());
+    }
+
+    fn request(body: &str) -> HttpRequest {
+        let mut req = HttpRequest::new("POST", "/test".to_string());
+        req.body = armature_core::Bytes::from(body.to_owned());
+        req
+    }
+
+    /// A rejected value must not come back to the client, even when the
+    /// validator attached it to the error.
+    #[test]
+    fn validation_failure_does_not_echo_submitted_values() {
+        #[derive(Debug, Deserialize)]
+        struct Login {
+            password: String,
+        }
+        impl Validate for Login {
+            fn validate(&self) -> Result<(), Vec<ValidationError>> {
+                Err(vec![
+                    ValidationError::new("password", "password is too short")
+                        .with_value(self.password.clone()),
+                ])
+            }
+        }
+
+        let err = ValidationPipe::parse::<Login>(&request(r#"{"password":"hunter2"}"#))
+            .expect_err("validation must fail");
+        assert!(matches!(err, Error::Validation(_)));
+        let client = err.client_message();
+        assert!(!client.contains("hunter2"), "{client}");
+        assert!(client.contains("password is too short"), "{client}");
+    }
+
+    /// serde's error text quotes the input and names the target type's fields;
+    /// the pipe must hand it to `Error::Deserialization`, which core redacts.
+    #[test]
+    fn invalid_json_is_redacted_for_the_client() {
+        let err = ValidationPipe::parse::<TestDto>(&request(r#"{"name":"x","age":"SECRET-123"}"#))
+            .expect_err("type mismatch must fail");
+        assert!(matches!(err, Error::Deserialization(_)));
+        let client = err.client_message();
+        assert!(!client.contains("SECRET-123"), "{client}");
+        assert!(!client.contains("age"), "{client}");
+        // Nor in the detail core logs.
+        let logged = err.to_string();
+        assert!(!logged.contains("SECRET-123"), "{logged}");
+    }
+
+    #[test]
+    fn parse_strict_requires_json_content_type() {
+        let body = r#"{"name":"x","age":1}"#;
+        for (ct, ok) in [
+            (None, false),
+            (Some("text/plain"), false),
+            (Some("application/x-www-form-urlencoded"), false),
+            (Some("multipart/form-data; boundary=x"), false),
+            (Some("application/json"), true),
+            (Some("Application/JSON; charset=utf-8"), true),
+            (Some("application/problem+json"), true),
+            (Some("application/+json"), false),
+            (Some("text/+json"), false),
+            (Some("application/aaaa\u{20AC}\u{20AC}"), false),
+            (Some("application/ +json"), false),
+            (Some("application/a b+json"), false),
+            (Some("application/\"x\"+json"), false),
+            (Some("application/json\u{00A0}"), false),
+            (Some("\tapplication/json "), true),
+            (Some(""), false),
+            (Some(" "), false),
+            (Some("\u{20AC}\u{20AC}\u{20AC}\u{20AC}\u{20AC}+json"), false),
+        ] {
+            let mut req = request(body);
+            if let Some(ct) = ct {
+                req.headers.insert("content-type", ct);
+            }
+            let result = ValidationPipe::parse_strict::<TestDto>(&req);
+            assert_eq!(result.is_ok(), ok, "{ct:?}");
+            if !ok {
+                assert!(matches!(result, Err(Error::UnsupportedMediaType(_))));
+            }
+        }
+    }
+
+    #[test]
+    fn parse_strict_rejects_duplicate_content_type() {
+        let mut req = request(r#"{"name":"x","age":1}"#);
+        req.headers.append("content-type", "application/json");
+        req.headers.append("content-type", "text/plain");
+        assert!(matches!(
+            ValidationPipe::parse_strict::<TestDto>(&req),
+            Err(Error::UnsupportedMediaType(_))
+        ));
+    }
+
+    #[test]
+    fn error_response_omits_values() {
+        let errors = ValidationErrors::new(vec![
+            ValidationError::new("password", "too short").with_value("hunter2"),
+        ]);
+        let response = ValidationPipe::error_response(errors);
+        assert_eq!(response.status, 400);
+        let body = String::from_utf8(response.body.to_vec()).unwrap();
+        assert!(!body.contains("hunter2"), "{body}");
+        assert!(body.contains("too short"), "{body}");
+    }
+
+    #[test]
+    fn validate_macro_returns_client_safe_error() {
+        fn handler(dto: TestDto) -> Result<TestDto, Error> {
+            validate!(dto);
+            Ok(dto)
+        }
+        let err = handler(TestDto {
+            name: String::new(),
+            age: 1,
+        })
+        .expect_err("empty name must fail");
+        assert!(matches!(err, Error::Validation(_)));
+        assert!(err.client_message().contains("Name is required"));
     }
 }
