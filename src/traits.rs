@@ -40,7 +40,9 @@ pub trait AsyncValidator: Send + Sync {
 }
 
 /// Validation context for additional data
-#[derive(Debug, Clone)]
+///
+/// `Debug` lists the keys only: the values are request data.
+#[derive(Clone)]
 pub struct ValidationContext {
     /// Request data or additional context
     pub data: std::collections::HashMap<String, String>,
@@ -66,8 +68,33 @@ impl ValidationContext {
     }
 }
 
+impl std::fmt::Debug for ValidationContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut keys: Vec<&String> = self.data.keys().collect();
+        keys.sort();
+        f.debug_struct("ValidationContext")
+            .field("keys", &keys)
+            .finish_non_exhaustive()
+    }
+}
+
 impl Default for ValidationContext {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn context_debug_hides_values() {
+        let ctx = ValidationContext::new().with_data("password".into(), "hunter2".into());
+        let debug = format!("{ctx:?}");
+        assert!(
+            debug.contains("password") && !debug.contains("hunter2"),
+            "{debug}"
+        );
     }
 }

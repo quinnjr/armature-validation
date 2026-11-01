@@ -7,6 +7,9 @@ updates:
     schedule:
       interval: "weekly"
       day: "monday"
+    # A release has a week to be yanked or flagged before it is proposed.
+    cooldown:
+      default-days: 7
     open-pull-requests-limit: 10
     commit-message:
       prefix: "deps(rust)"
@@ -20,12 +23,29 @@ updates:
         update-types:
           - "patch"
 
+  # The fuzz harness is its own workspace, so it needs its own entry.
+  - package-ecosystem: "cargo"
+    directory: "/fuzz"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    # A release has a week to be yanked or flagged before it is proposed.
+    cooldown:
+      default-days: 7
+    commit-message:
+      prefix: "deps(fuzz)"
+    labels:
+      - "dependencies"
+
   # Keeps the SHA-pinned actions in .github/workflows current.
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
       interval: "weekly"
       day: "monday"
+    # A release has a week to be yanked or flagged before it is proposed.
+    cooldown:
+      default-days: 7
     commit-message:
       prefix: "deps(actions)"
     labels:
