@@ -146,6 +146,11 @@ dependency features this crate used to enable for its consumers are gone.
   `h1-backend` default selects the server implementation, which a dependency
   must not override). A downstream crate that relied on this crate enabling
   those features through feature unification must now enable them itself.
+- **Breaking:** requires `armature-proc-macro` 0.7 (was `0.6`), so
+  `#[derive(Validate)]` re-exported as `armature_validation::Validate` gets
+  that release's hardening: values cleared from errors, nested errors under
+  `parent.child` paths, NaN-safe `range`, expansion-time regex checks, and
+  compile errors for attribute forms it used to accept. See its changelog.
 - Dependencies: `once_cell` replaced by `std::sync::LazyLock`; `regex-syntax`
   0.8 is a direct dependency (used by `Matches::full`).
 - The published package is limited to the library, tests, benches and docs
