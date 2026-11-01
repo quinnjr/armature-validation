@@ -14,7 +14,7 @@ Request validation for the Armature framework.
 
 ```toml
 [dependencies]
-armature-validation = "0.7"
+armature-validation = "0.8"
 ```
 
 ## Quick Start

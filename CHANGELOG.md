@@ -9,9 +9,11 @@ Earlier changes are recorded in the workspace [`CHANGELOG.md`](https://github.co
 
 ## [Unreleased]
 
-Breaking: the next release is 0.8.0. Validators reject more input (see the
-entries marked breaking), error output no longer carries submitted values, and
-dependency features this crate used to enable for its consumers are gone.
+## [0.8.0] - 2026-11-01
+
+Breaking: validators reject more input (see the entries marked breaking), error
+output no longer carries submitted values, and dependency features this crate
+used to enable for its consumers are gone.
 
 ### Security
 
