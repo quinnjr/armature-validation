@@ -28,7 +28,7 @@ url = "2.5"
 regex = "1.13"
 # Builds the requests `ValidationPipe::parse_strict` is fuzzed with; the
 # version `armature-validation` itself requires.
-armature-core = "0.12"
+armature-core = "0.13"
 serde = "1.0"
 
 [[bin]]
